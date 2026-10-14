@@ -200,6 +200,9 @@ Chrome 136+ 禁止在默认用户数据目录上开 CDP 端口，必须用独立
 
 代码里针对某个平台的每个选择器都附了坑位注释和实测日期——平台改版时请先读注释再改。
 
+各平台的「含 AI 生成内容」声明是平台侧要求。关掉配置里的 `publish.declare_ai`
+只是让脚本不代填，发布前仍需你自己勾选，否则可能被平台拦截。
+
 ## License
 
-MIT，见 [LICENSE](LICENSE)。
+MIT，见 [LICENSE](LICENSE)。使用风险与合规提示见 [NOTICE](NOTICE)。
