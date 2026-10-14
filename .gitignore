@@ -1,0 +1,19 @@
+# 用户配置（含内容领域偏好、公众号凭证）——不进版本控制
+config.yaml
+config.yaml.bak
+
+# 出口 IP 记录（含本机公网 IP 与变更历史）——不入库
+wechat-ip.json
+
+# 截图留档
+screenshots/
+
+# 专用浏览器 profile：里面是各平台登录态（cookie/token），绝不入库
+.browser-profile/
+
+# 依赖
+node_modules/
+
+# 逐平台调试截图（脚本每步自动落盘，正常使用会产生）
+dbg-*.png
+*.log

@@ -1,0 +1,33 @@
+{
+  "name": "publish-kit",
+  "version": "0.1.0",
+  "description": "多平台图文/视频自动填单工具集 —— 只填到发布按钮前，绝不点击发布",
+  "main": "bin/publish.cjs",
+  "bin": {
+    "publish-kit": "bin/publish.cjs"
+  },
+  "scripts": {
+    "init": "node bin/init.cjs",
+    "doctor": "node bin/doctor.cjs",
+    "login": "node bin/login.cjs"
+  },
+  "keywords": [
+    "publish",
+    "automation",
+    "patchright",
+    "cdp",
+    "douyin",
+    "bilibili",
+    "zhihu",
+    "weibo"
+  ],
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "patchright": "^1.62.3",
+    "yaml": "^2.4.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

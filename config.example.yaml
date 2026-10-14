@@ -1,0 +1,87 @@
+# publish-kit 配置文件
+#
+# 用法：node bin/init.cjs 会问几个问题并生成 config.yaml（推荐），
+#       或复制本文件为 config.yaml 手填。
+#
+# 本文件是模板，不含个人信息，可安全入库；config.yaml 含你的偏好与凭证，已进 .gitignore。
+#
+# ─────────────────────────────────────────────────────────────
+# 关于留空的统一约定
+#
+#   所有平台字段（分区/分类/合集…）留空 = 脚本不碰这个字段，
+#   并在控制台明确告警提示你手动填。
+#
+#   脚本永远不会猜一个默认值替你填上——猜错的值会静默落到发布页上，
+#   比留空更糟：留空你能一眼看见告警，猜错你可能发现得晚。
+# ─────────────────────────────────────────────────────────────
+
+runtime:
+  # CDP 调试端口。
+  # 注意：Windows 上靠近动态端口段的固定端口可能被系统保留导致起不来，
+  #      换端口前先跑 `netsh interface ipv4 show excludedportrange protocol=tcp` 查一下。
+  cdp_url: "http://127.0.0.1:39223"
+
+  # Chrome 可执行文件路径。留空则 doctor 自动探测常见安装位置。
+  chrome_path: ""
+
+  # 专用浏览器 profile 目录，登录态全存在这里。
+  # 必须用独立目录：Chrome 136+ 禁止在默认用户数据目录上开 CDP 端口。
+  # 目录一旦定下就别移动，登录态会一直复用。
+  profile_dir: "~/.publish-profile"
+
+content:
+  # 你的内容领域（AI 科技 / 财经 / 美食…）。init 会问这一项，
+  # 各平台的分区/分类默认值由它推导，可在下面逐平台覆盖。
+  domain: ""
+
+  # 界面语言。注意：各平台选择器是按中文界面写的，切成 en 跑不通。
+  language: zh
+
+publish:
+  # 「含 AI 生成内容」声明。多数平台已强制要求，默认开。
+  declare_ai: true
+
+  # 每步截图留档目录，便于回溯填单结果
+  screenshot_dir: "./screenshots"
+
+platforms:
+  # ── 视频线 ──────────────────────────────────────────────
+  bilibili:
+    enabled: true
+    # 分区名，如「人工智能」。留空 = 不碰分区，保留平台系统推荐 + 控制台告警
+    category_hint: ""
+
+  weibo:
+    enabled: true
+    # 分类频道名，如「科技数码」。留空 = 不填
+    channel_hint: ""
+
+  zhihu:
+    enabled: true
+    # 所属领域，如「科技互联网」。留空 = 不填
+    field_hint: ""
+
+  douyin:
+    enabled: true
+    # 合集名，如「每日新闻」。留空 = 不选择合集
+    album: ""
+    # 自主声明「内容由AI生成」
+    self_declare: true
+
+  shipinhao:
+    enabled: false
+    # 合集名，留空 = 不选
+    album: ""
+    # 是否自动设为「不显示位置」。默认 false —— 这是替你点掉一个你没说过的选择，
+    # 不该默认开。init 会问这一项。
+    hide_location: false
+
+  # ── 图文线 ──────────────────────────────────────────────
+  wechat:
+    enabled: true
+    # 公众号贴图走官方 API（不走浏览器），需要你自己的 AppID / AppSecret
+    # 获取：mp.weixin.qq.com → 设置与开发 → 基本配置
+    app_id: ""
+    app_secret: ""
+    # newspic 单条图片数上限（微信侧限制）
+    max_images: 20

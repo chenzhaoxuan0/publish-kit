@@ -1,0 +1,33 @@
+MIT License
+
+Copyright (c) 2026 publish-kit contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+⚠️ 使用前请知悉
+
+本工具通过浏览器自动化在各平台的创作者后台执行「填表」，并停在「发布」按钮前，
+由你本人点击发布。它不调用任何平台的官方发布接口。
+
+请自行确认你所在平台的用户协议对自动化操作的规定，并自行承担使用后果。
+部分平台会对使用自动化工具的账号做限制处置——这是真实发生过的，不是理论风险。
+
+作者不对因违反平台服务条款导致的账号限流、封禁、内容下架等后果承担责任。

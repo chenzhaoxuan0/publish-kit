@@ -1,0 +1,16 @@
+# 统一行尾为 LF，避免不同平台的贡献者互相看到「整个文件都变了」的假 diff。
+# （Windows 上开发时 Git 会把 CRLF 转成 LF 入库，检出时再按 .gitattributes 还原）
+* text=auto eol=lf
+
+*.cjs text eol=lf
+*.js  text eol=lf
+*.md  text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+
+# 二进制/图片不进仓库，但万一有人强加也按二进制处理，避免 git 尝试做行尾转换损坏文件
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.mp4 binary
+*.webm binary
