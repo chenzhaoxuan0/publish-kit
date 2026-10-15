@@ -14,6 +14,12 @@
 //       表单补填模式（2026-10-14 加）：视频已在 upload/channel 页、只字段被清空时，
 //       复用该页重填 类型/内容声明/标题/正文话题/分类；不导航、不关页、不重传视频、
 //       不碰封面（合成 click 会重置表单，见 09-21 坑位）。
+//       ⚠ 正文是 keyboard.type 直输、没有先清空（weibo 正文无 select-all 语义），
+//       所以本模式**只适用于正文为空**的补填；对已有正文的页面跑会把文字叠加两遍。
+//   node platforms/weibo.cjs channel --channel "科技数码" [--sub "科技"]
+//       仅补选分类频道（2026-10-15 加）：复用现有 upload/channel 页，只做级联下拉这一件事，
+//       不导航、不关页、不碰视频/封面/标题/正文——交割后只想改分类时用它。
+//   --channel "<一级频道>" [--sub "<二级子频道>"]  一条龙模式下也可显式传分类（优先于 config）
 //   --cover  传自定义封面（2026-09-21 经实测确定：微博用竖封面 3:4，非 16:9）
 //
 // ── 依赖处理方式 ────────────────────────────────────────────────────
@@ -66,6 +72,110 @@ const { setVideoFile, resolveOpenFileChooser } = require('../lib/bigfile-upload.
 // 截图统一落 config.yaml 的 publish.screenshot_dir（不写死在脚本旁边）
 const shotPath = (name) => path.join(cfg.screenshotDir(), name);
 
+// ── 分类频道（2026-10-15 按实锤 DOM 重写）────────────────────────────
+// 微博 upload/channel 的分类是**级联双栏**下拉：左栏一级频道(_item1_)、右栏是该
+// 一级频道的二级子频道(_item2_)。三个实测要点，都是踩过的坑：
+//   ① 点一级只切右栏、不选中（点「科技数码」后控件仍显示「请选择合适的频道」，
+//      右栏换成 评测开箱/手机平板/电脑装机/摄影摄像/影音智能/科技/数码综合）；
+//      必须再点二级才落值。
+//   ② **悬停不触发切换**，必须 mouse.click；且两级列表各自可滚动，取坐标前要
+//      scrollIntoView 再重取 rect——不滚动的话坐标落在滚动容器裁剪区外，点了没反应。
+//   ③ 同名子项跨频道重复（「美食」「时尚美妆」在 VLOG 和 生活 下都有），只按文案
+//      匹配会选到隔壁频道的分类上去。所以默认按「一级 + 二级」两级点，
+//      并且**不指定 sub 又有多于一个子项时直接判失败**，不盲选第一个
+//      （旧逻辑取「第一个可见 _item2_」正是这个隐患）。
+// readback 只信控件最终显示值，且要求与「二级名」或「一级名」双向包含匹配——
+// 不拿「点到的那个元素的 textContent」当期望值，那是自证不是校验。
+async function selectChannel(p, channel, sub) {
+  // 面板未开则点开；已开直接返回 'already'
+  const ensureOpen = () => p.evaluate(() => {
+    if ([...document.querySelectorAll('[class*="_item1_"]')].some((e) => e.offsetParent !== null)) return 'already';
+    const vis = (el) => el && el.offsetParent !== null;
+    const lab = [...document.querySelectorAll('*')]
+      .find((el) => vis(el) && el.childElementCount === 0 && (el.textContent || '').trim() === '分类');
+    const row = lab && lab.parentElement;
+    const sel = row && [...row.querySelectorAll('[class*="wbpro-select"]')].filter(vis)[0];
+    if (!sel) return null;
+    sel.scrollIntoView({ block: 'center' });
+    const r = sel.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + Math.min(r.height / 2, 20) };
+  });
+  // 定位列表项：先滚到容器中间再取坐标，并回报是否真在视口内
+  const locate = (cls, text) => p.evaluate(({ cls, text }) => {
+    const vis = (el) => el && el.offsetParent !== null;
+    const el = [...document.querySelectorAll(`[class*="${cls}"]`)]
+      .filter(vis).find((e) => (e.textContent || '').trim() === text);
+    if (!el) return null;
+    el.scrollIntoView({ block: 'center', inline: 'nearest' });
+    const r = el.getBoundingClientRect();
+    return {
+      x: r.x + r.width / 2, y: r.y + r.height / 2,
+      inView: r.height > 4 && r.top >= 0 && r.bottom <= innerHeight,
+    };
+  }, { cls, text });
+  const listLv = (cls) => p.evaluate((cls) => {
+    const vis = (el) => el && el.offsetParent !== null;
+    return [...new Set([...document.querySelectorAll(`[class*="${cls}"]`)]
+      .filter(vis).map((e) => (e.textContent || '').trim()).filter(Boolean))];
+  }, cls);
+  const readDisplay = () => p.evaluate(() => {
+    const vis = (el) => el && el.offsetParent !== null;
+    const lab = [...document.querySelectorAll('*')]
+      .find((el) => vis(el) && el.childElementCount === 0 && (el.textContent || '').trim() === '分类');
+    const row = lab && lab.parentElement;
+    const sel = row && [...row.querySelectorAll('[class*="wbpro-select"]')].filter(vis)[0];
+    const val = sel && sel.querySelector('.woo-box-item-flex');
+    return val ? (val.textContent || '').trim().slice(0, 40) : null;
+  });
+
+  let last = { ok: false, diag: '', display: null, clicked2: null };
+  for (let round = 1; round <= 3 && !last.ok; round++) {
+    const c = await ensureOpen();
+    if (!c) return { ok: false, diag: '分类控件未定位（表单未展开？）', display: null, clicked2: null };
+    if (c !== 'already') { await p.mouse.click(c.x, c.y); await sleep(1500); }
+
+    let pos = await locate('_item1_', channel);
+    if (!pos) { last = { ok: false, diag: '下拉里没有一级频道「' + channel + '」', display: await readDisplay(), clicked2: null }; await sleep(1200); continue; }
+    await sleep(500);
+    pos = await locate('_item1_', channel);
+    if (!pos || !pos.inView) { last = { ok: false, diag: '一级频道「' + channel + '」滚动后仍不在视口内', display: null, clicked2: null }; await sleep(1200); continue; }
+    await p.mouse.click(pos.x, pos.y);
+    await sleep(1600);
+
+    const lv2 = await listLv('_item2_');
+    let clicked2 = null;
+    if (sub) {
+      pos = await locate('_item2_', sub);
+      if (!pos) { last = { ok: false, diag: '二级「' + sub + '」不在一级「' + channel + '」的子列表（现有: ' + lv2.join('/') + '）', display: null, clicked2: null }; await sleep(1200); continue; }
+      await sleep(400);
+      pos = await locate('_item2_', sub);
+      if (!pos || !pos.inView) { last = { ok: false, diag: '二级「' + sub + '」滚动后仍不在视口内', display: null, clicked2: null }; await sleep(1200); continue; }
+      await p.mouse.click(pos.x, pos.y);
+      clicked2 = sub;
+      await sleep(1600);
+    } else if (lv2.length === 1) {
+      pos = await locate('_item2_', lv2[0]);
+      if (pos && pos.inView) { await p.mouse.click(pos.x, pos.y); clicked2 = lv2[0]; await sleep(1600); }
+    } else if (lv2.length > 1) {
+      last = {
+        ok: false,
+        diag: '一级「' + channel + '」下有 ' + lv2.length + ' 个二级子项（' + lv2.join('/') + '），未指定 --sub 不盲选——请显式指定',
+        display: null, clicked2: null,
+      };
+      await sleep(1200);
+      continue;
+    }
+
+    const back = await readDisplay();
+    const expect = [sub, channel].filter(Boolean);
+    const ok = !!back && back.length >= 2
+      && expect.some((e) => back === e || e.includes(back) || back.includes(e));
+    last = { ok, diag: ok ? '' : '回读未确认（控件显示: ' + JSON.stringify(back) + '）', display: back, clicked2 };
+    if (!ok) await sleep(1200);
+  }
+  return last;
+}
+
 function parseArgs(argv) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -83,20 +193,24 @@ function parseArgs(argv) {
   // 与 cover 模式同样「复用现有 upload/channel 标签页」，但不碰封面，且跳过交割护栏
   // （护栏本来是拦「已填好被人接管」的页；这里恰恰是要重填一个空表单）。
   const fillOnly = sub === 'fill';
-  if (sub && !coverOnly && !fillOnly) throw new Error('未知子命令: ' + sub);
+  // channel 模式（2026-10-15）：交割后只补分类频道，其余字段一律不碰。
+  const channelOnly = sub === 'channel';
+  if (sub && !coverOnly && !fillOnly && !channelOnly) throw new Error('未知子命令: ' + sub);
   const CDP = process.env.CDP_URL || cfg.cdpUrl();
   if (coverOnly) {
     if (!args.cover || !fs.existsSync(args.cover)) throw new Error('cover 模式缺 --cover 或文件不存在');
   } else if (fillOnly) {
     if (!args.title) throw new Error('fill 模式缺 --title');
     if (!args['body-file'] || !fs.existsSync(args['body-file'])) throw new Error('fill 模式缺 --body-file 或文件不存在');
+  } else if (channelOnly) {
+    if (!args.channel) throw new Error('channel 模式缺 --channel "<一级频道>"（子频道用 --sub "<二级>"）');
   } else {
     if (!args.video || !fs.existsSync(args.video)) throw new Error('缺 --video 或文件不存在');
     if (!args['body-file'] || !fs.existsSync(args['body-file'])) throw new Error('缺 --body-file');
   }
   // 结尾截图统一落 publish.screenshot_dir（目录不存在即建）
   fs.mkdirSync(cfg.screenshotDir(), { recursive: true });
-  const SHOT = shotPath('weibo.png');
+  const SHOT = shotPath(channelOnly ? 'weibo-channel.png' : 'weibo.png');
   const body = args['body-file'] ? fs.readFileSync(path.resolve(args['body-file']), 'utf-8').trim() : '';
   const text = args.title ? `${args.title}\n${body}` : body;
 
@@ -104,9 +218,9 @@ function parseArgs(argv) {
   const ctx = browser.contexts()[0];
   const weiboTabs = ctx.pages().filter((x) => /weibo\.com/.test(x.url()) && !/passport/.test(x.url()));
   let p = null;
-  if (coverOnly || fillOnly) {
+  if (coverOnly || fillOnly || channelOnly) {
     p = weiboTabs.find((x) => /upload\/channel/.test(x.url()));
-    if (!p) throw new Error((fillOnly ? 'fill' : 'cover') + ' 模式：未找到已打开的 weibo.com/upload/channel 标签页（先跑一条龙把视频传上）');
+    if (!p) throw new Error((channelOnly ? 'channel' : fillOnly ? 'fill' : 'cover') + ' 模式：未找到已打开的 weibo.com/upload/channel 标签页（先跑一条龙把视频传上）');
   } else {
     // 交割护栏（2026-09-25 加固）：全量 textarea/contenteditable 检测，阈值 10 字。
     // 旧选择器（placeholder*="新鲜事"/_input_）测不到投稿页 composer，导致遗留页旧文后追加（当日实证）。
@@ -130,8 +244,8 @@ function parseArgs(argv) {
 
   // 1) 上传视频（2026-09-18 起：upload/channel 改为投稿表单，setInputFiles 不再触发上传，
   //    必须点「上传视频」按钮 + 拦截原生 filechooser；失败再回退 setInputFiles）
-  //    cover / fill 两种补投模式整段跳过（视频已在页面上）
-  if (!coverOnly && !fillOnly) {
+  //    cover / fill / channel 三种补投模式整段跳过（视频已在页面上）
+  if (!coverOnly && !fillOnly && !channelOnly) {
   const videoPath = path.resolve(args.video);
   let videoConfirmed = false;
   try {
@@ -204,7 +318,7 @@ function parseArgs(argv) {
     }
     console.log('fill 模式：检测到视频仍在页上（上传完成=' + alive.done + '，video 有 src=' + alive.vid + '），开始补填字段');
   }
-  if (!coverOnly) {
+  if (!coverOnly && !channelOnly) {
   // 1.5) 投稿表单必填项最小化补选（类型=原创、内容声明、标题）
   //      内容声明是否点选由 config.yaml 的 publish.declare_ai 决定（cfg.declareAi()，默认开）。
   //      关闭时整段跳过、不碰声明控件——平台侧是否强制要求声明由使用者自行判断，
@@ -403,104 +517,40 @@ function parseArgs(argv) {
   });
   if (verify.len < 50) throw new Error('composer 回读 len=' + verify.len + '，文字未落表单（head=' + JSON.stringify(verify.head) + '）');
   console.log('文字已填（话题下拉选中 ' + linked + '，纯文本 ' + plainTags.length + '，回读 ' + verify.len + ' 字：' + JSON.stringify(verify.head) + '…）');
-  // 3.2) 分类频道（2026-10-02 按实锤 DOM 重写：DOM 侦察确认结构——
-  //      label「分类」(_tit1_*) 与控件**不在同一行**：控件 .wbpro-select 在 label 下方
-  //      ~30px 的兄弟容器里，且宽 636px（旧逻辑「同行 +40px 且宽≤500」两个条件同时把
-  //      它过滤掉 → 当时报「控件未定位到」）；下拉为**单层频道列表**（_item1_*，各频道
-  //      同级，无二级）。流程：label → 行容器内找 .wbpro-select → scrollIntoView → 点开 →
-  //      点叶子（文本 = 配置的 channel_hint）→ 回读控件显示值（.woo-box-item-flex，
-  //      未选=「请选择合适的频道」）确认已变；万一出现二级面板再点其中第一项。3 轮重试，
-  //      失败转人工。
-  //      未配置 channel_hint → 整段跳过、不点下拉 + 告警。不内置任何默认分类：猜错的分类
-  //      会静默落到发布页上，用户在发布前不一定会发现；留空的告警是一次明确提醒。
-  const channel = cfg.hint('weibo', 'channel_hint');
+  // 3.2) 分类频道：级联双栏（结构与坑位见文件头 selectChannel 的注释）
+  //      未配置 channel_hint 且命令行也没给 --channel → 整段跳过、不点下拉 + 告警。
+  //      不内置任何默认分类：猜错的分类会静默落到发布页上，用户在发布前不一定会发现；
+  //      留空的告警是一次明确提醒。
+  const channel = args.channel || cfg.hint('weibo', 'channel_hint');
+  const channelSub = args.sub || null;
   if (!channel) {
     cfg.warnSkipped('weibo', 'channel_hint', '微博分类频道');
   } else {
-  try {
-    let catOk = false, diag = '';
-    for (let round = 1; round <= 3 && !catOk; round++) {
-      const clicked = await p.evaluate(() => {
-        const vis = (el) => el && el.offsetParent !== null;
-        const lab = [...document.querySelectorAll('*')].find((el) => vis(el) && el.childElementCount === 0 && (el.textContent || '').trim() === '分类');
-        if (!lab) return { err: 'label「分类」未找到' };
-        const row = lab.parentElement;
-        const sel = row && ([...row.querySelectorAll('[class*="wbpro-select"]')].filter(vis)[0]
-          || [...row.querySelectorAll('*')].find((el) => vis(el) && /请选择/.test((el.textContent || '').trim()) && el.getBoundingClientRect().height > 20 && el.getBoundingClientRect().width > 100));
-        if (!sel) return { err: '行容器内未找到 select 控件' };
-        sel.scrollIntoView({ block: 'center' });
-        const r = sel.getBoundingClientRect();
-        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-      });
-      if (clicked.err) { diag = clicked.err; await sleep(3000); continue; }
-      await p.mouse.click(clicked.x, clicked.y);
-      await sleep(2000);
-      const lv1 = await p.evaluate((name) => {
-        const el = [...document.querySelectorAll('*')].find((e) => e.offsetParent !== null && e.childElementCount === 0 && (e.textContent || '').trim() === name && e.getBoundingClientRect().width > 20);
-        if (!el) return null;
-        el.scrollIntoView({ block: 'center' });
-        const r = el.getBoundingClientRect();
-        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-      }, channel);
-      if (!lv1) { diag = '下拉未展开或无「' + channel + '」项'; continue; }
-      await p.mouse.click(lv1.x, lv1.y);
-      await sleep(1800);
-      // 二级面板兜底：实测结构下拉是单层的，这一步通常不命中；万一微博改版出了二级面板，
-      // 取第一个可见的 _item2_ 叶子点掉。不写死任何具体频道名（原本写死了一个二级项）。
-      const lv2 = await p.evaluate(() => {
-        const el = [...document.querySelectorAll('*')].find((e) => e.offsetParent !== null && e.childElementCount === 0 && (e.className || '').toString().includes('_item2_') && e.getBoundingClientRect().width > 10);
-        if (!el) return null;
-        const r = el.getBoundingClientRect();
-        return { x: r.x + r.width / 2, y: r.y + r.height / 2, t: (el.textContent || '').trim() };
-      });
-      if (lv2) { await p.mouse.click(lv2.x, lv2.y); console.log('分类二级面板：已点第一项「' + lv2.t + '」'); await sleep(1500); }
-      // 判据：控件已从「请选择…」占位文案变成实际频道名，**且**显示值确实是我们要的。
-      // 允许三种命中：① 显示值等于配置的频道名；② 等于/包含刚才二级面板实际点掉的
-      // 叶子名（点了二级项时控件只显示末级名字是正常的）；③ 显示值是频道名的子串
-      // （微博有时只显示「科技」而非「科技数码」）。
-      //
-      // 之所以不用「back && !/请选择/.test(back)」这种宽松判据：二级面板取的是页面上
-      // 第一个可见 _item2_，点错时回读照样有值，宽松判据会把「分类错了」报成
-      // 「分类已选 ✓」，错分类就静默落到发布页上——而脚本的终点恰恰是让用户点发布。
-      // 单字回读不参与包含匹配，避免「科」这种碎片误判为命中。
-      const back = await p.evaluate(() => {
-        const lab = [...document.querySelectorAll('*')].find((el) => el.offsetParent !== null && el.childElementCount === 0 && (el.textContent || '').trim() === '分类');
-        if (!lab) return null;
-        const row = lab.parentElement;
-        const sel = row && [...row.querySelectorAll('[class*="wbpro-select"]')].filter((e) => e.offsetParent !== null)[0];
-        const val = sel && sel.querySelector('.woo-box-item-flex');
-        return val ? (val.textContent || '').trim().slice(0, 30) : null;
-      });
-      const expect = [channel].filter(Boolean);
-      // 不把 lv2.t 放进期望集：lv2.t 是「我们刚点的那个元素」的 textContent，
-      // 拿它当期望值等于「点谁算谁对」，回读必然通过 —— 那是自证，不是校验。
-      // 二级面板点错项时会把「分类错了」报成「分类已选 ✓」，错分类静默落到发布页。
-      //
-      // 代价：微博真出了二级面板、控件只显示末级名字（如「数码」）时这里会判失败
-      // → 重试 3 轮 → 转人工。这是刻意选的失败方向：宁可明说「我没把握，你去看一眼」，
-      // 也不要把可能错的分类报成对的。双向子串则保住「只显示『科技』」的正常情形。
-      const hit = back && back.length >= 2
-        && expect.some((e) => back === e || e.includes(back) || back.includes(e));
-      if (hit) {
-        console.log('分类频道已选（回读: ' + back + '）✓');
-        catOk = true;
-      } else if (lv2) {
-        // 点了二级面板但回读对不上：无法确认落点，如实说明而不是放行
-        console.log('提示：已点二级项「' + lv2.t + '」，但回读是「' + (back || '空') + '」，'
-          + '与配置的「' + channel + '」对不上 —— 疑似层级判断有误，转人工确认。');
-        diag = '二级面板已点但回读与配置频道不符（显示: ' + JSON.stringify(back) + '）';
-        await sleep(2000);
+    try {
+      const r = await selectChannel(p, channel, channelSub);
+      if (r.ok) {
+        console.log('分类频道已选（' + channel + (r.clicked2 ? ' / ' + r.clicked2 : '') + '，控件回读: ' + r.display + '）✓');
       } else {
-        diag = '回读未确认（显示: ' + JSON.stringify(back) + '）';
-        await sleep(2000);
+        console.log('警告：分类频道填写失败（' + r.diag + '）——转人工，发布前请在表单手选「' + channel + '」');
       }
+    } catch (e) {
+      console.log('警告：分类频道填写失败（' + String(e.message || e).slice(0, 120) + '）——转人工，发布前请在表单手选「' + channel + '」');
     }
-    if (!catOk) console.log('警告：分类频道填写失败（' + diag + '）——转人工，发布前请在表单手选「' + channel + '」');
-  } catch (e) {
-    console.log('警告：分类频道填写失败（' + String(e.message || e).slice(0, 120) + '）——转人工，发布前请在表单手选「' + channel + '」');
   }
   }
-  } // end !coverOnly（字段填单段：类型/声明/标题 + 正文话题 + 分类）
+  if (channelOnly) {
+    // channel 模式到此为止：只做了分类这一件事，不碰视频/封面/标题/正文。
+    const r = await selectChannel(p, args.channel, args.sub || null);
+    await p.screenshot({ path: SHOT });
+    console.log('screenshot →', SHOT);
+    if (!r.ok) {
+      console.error('FATAL 分类频道未选中（' + r.diag + '）——表单未被改动，请人工在下拉里手选');
+      process.exit(1);
+    }
+    console.log('分类频道已选（' + args.channel + (r.clicked2 ? ' / ' + r.clicked2 : '') + '，控件回读: ' + r.display + '）✓');
+    console.log('STATUS: 已停在「发送」按钮前，等待用户点击发送');
+    process.exit(0);
+  }
   // 3.5) 自定义封面（--cover；微博用竖封面 3:4，2026-09-21 经实测确定）
   // fill 模式显式跳过封面：封面已在页上，且上传封面的入口必须真实 mouse.click
   // （合成 click 会重置整页表单，09-21 实测），在补填场景里没必要冒这个险。
@@ -591,4 +641,4 @@ function parseArgs(argv) {
   console.log('screenshot →', SHOT);
   console.log('STATUS: 已停在「发送」按钮前，等待用户点击发送（发送前请确认缩略图为视频模式）');
   process.exit(0);
-})().catch((e) => { console.error('FATAL', e.message); process.exit(1); });
+})().catch((e) => { console.error('FATAL', e.message); if (process.env.WB_DEBUG_STACK) console.error(e.stack); process.exit(1); });
