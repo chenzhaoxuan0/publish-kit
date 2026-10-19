@@ -101,7 +101,13 @@ function parseArgs(argv) {
 
   // 1) creator 页 → 开始创作 → 发视频
   if (!p && !coverOnly) {
-    p = ctx.pages().find((x) => /zhihu\.com/.test(x.url())) || await ctx.newPage();
+    // 2026-10-19 修（重要）：原来这里会「接管任意已有的知乎标签页」再 goto /creator。
+    // 而 /creator 正是**想法（图文）编辑器**所在页——goto 会把已填好的想法整个冲掉。
+    // 2026-10-19 实测事故：先跑 zhihu-pin.cjs 填好知乎想法（图文），再跑本脚本发视频，
+    // 结果想法页被导航走，**图文在发布前就没了**，得重传一遍。
+    // 现在一律另开新页跑视频：creator 页上已填的想法原样保留。
+    const preVideoPages = new Set(ctx.pages().filter((x) => /zhihu\.com\/upload-video/.test(x.url())));
+    p = await ctx.newPage();
     await p.goto('https://www.zhihu.com/creator', { timeout: 45000, waitUntil: 'domcontentloaded' }).catch(() => {});
     await sleep(5000);
     await p.evaluate(() => {
@@ -118,8 +124,11 @@ function parseArgs(argv) {
     });
     await sleep(6000);
     if (!/upload-video/.test(p.url())) {
-      p = ctx.pages().find((x) => /zhihu\.com\/upload-video/.test(x.url()));
-      if (!p) throw new Error('未进入 upload-video 页: ' + p.url());
+      // 「发视频」通常另开标签页：优先挑**新开**的那个，别抢走已有的 upload-video 页
+      const cands = ctx.pages().filter((x) => /zhihu\.com\/upload-video/.test(x.url()));
+      const fresh = cands.find((x) => !preVideoPages.has(x));
+      p = fresh || cands[cands.length - 1];
+      if (!p) throw new Error('未进入 upload-video 页');
     }
   }
   await p.bringToFront();

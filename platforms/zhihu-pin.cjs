@@ -101,16 +101,23 @@ function parseArgs(argv) {
   const browser = await chromium.connectOverCDP(process.env.CDP_URL || cfg.cdpUrl(), { timeout: 15000 });
   const ctx = browser.contexts()[0];
 
-  // 交割护栏
+  // 交割护栏 + 关旧页：**只针对想法页**（2026-10-19 修）
+  //   原来这里扫的是「所有知乎标签页」，于是两件事都会出事：
+  //   ① 视频投稿页（upload-video）里已填的标题/介绍会被当成「已交割的想法」而误拦；
+  //   ② 更糟——后面那行「关掉所有知乎标签页」会**连同已填好的视频表单一起关掉**。
+  //   现在：只管非 upload-video 的知乎页（=想法页），upload-video 页原样保留。
+  const pinTabs = ctx.pages().filter((x) => /zhihu\.com/.test(x.url()) && !/upload-video/.test(x.url()));
+  const keepVideo = ctx.pages().filter((x) => /zhihu\.com\/upload-video/.test(x.url()));
+  if (keepVideo.length) console.log('检测到 ' + keepVideo.length + ' 个知乎视频投稿页（已填表单），原样保留不碰');
   if (!process.argv.includes('--force')) {
-    for (const t of ctx.pages().filter((x) => /zhihu\.com/.test(x.url()))) {
+    for (const t of pinTabs) {
       const filled = await t.evaluate(() => [...document.querySelectorAll('textarea, [contenteditable="true"]')]
         .map((e) => ((e.value || e.textContent || '')).trim()).filter((s) => s.length > 10)
         .map((s) => s.slice(0, 30))).catch(() => []);
-      if (filled.length) throw new Error('[交割护栏] 知乎页已有文字（疑似已交割或遗留草稿）:' + JSON.stringify(filled) + '。请人工关闭该标签页后重跑；确认可弃加 --force。');
+      if (filled.length) throw new Error('[交割护栏] 知乎想法页已有文字（疑似已交割或遗留草稿）:' + JSON.stringify(filled) + '。请人工关闭该标签页后重跑；确认可弃加 --force。');
     }
   }
-  for (const t of ctx.pages().filter((x) => /zhihu\.com/.test(x.url()))) await t.close().catch(() => {});
+  for (const t of pinTabs) await t.close().catch(() => {});
   const p = await ctx.newPage();
   await p.goto('https://www.zhihu.com/creator', { timeout: 45000, waitUntil: 'domcontentloaded' }).catch(() => {});
   await sleep(9000);
