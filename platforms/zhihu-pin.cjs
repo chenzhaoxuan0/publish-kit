@@ -11,6 +11,13 @@
 //   --title      并入正文首行
 //   --count      实际张数（默认 6）
 //   --force      跳过「交割护栏」。护栏检测到页面上已有文字就中止，是为了不污染真实发布页。
+//   --manual-images
+//                跳过自动配图（默认不启用）。自动传图链路有个未解缺陷：
+//                Modal 内点「插入图片」后，落进编辑器的可能是平台默认活动推广图，
+//                用户自己的图被静默丢弃，容器内仍是 0 图（详见 04_skills/
+//                news-publisher/image-post-flow.md 的「未解」条）。
+//                打开后只自动填正文、截图、停在「发布」前，配图由人工在编辑器里补。
+//                ——这是**降级**开关，不是修复；将来链路修通后应删掉它。
 //
 // 流程：https://www.zhihu.com/creator 创作中心 → 「分享此刻的想法…」编辑器（常驻页面）
 //   → 点工具栏图片按钮 → 三层 UI 上传 → 逐张点选预览 → 「插入图片」
@@ -40,6 +47,8 @@
 //      别按「发想法」找。
 //   ⑦ 图片落稿的判据必须限定在编辑器容器内数 <img>；全页面缩略图统计恒 ≥count，
 //      侧栏推荐位会造假阳性——曾因此「图片已上稿 ✓」而草稿里零图。
+//   ⑧ 自动传图链路目前**跑不通**（编辑器容器内恒 0 图）。--manual-images 是降级出路：
+//      跳过整段配图，只填正文停在「发布」前，人工补图。详见 image-post-flow.md。
 const fs = require('fs');
 const path = require('path');
 const cfg = require('../lib/config.cjs');
@@ -52,8 +61,14 @@ const shotPath = (name) => path.join(cfg.screenshotDir(), name);
 function parseArgs(argv) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i].startsWith('--')) out[argv[i].slice(2)] = argv[i + 1], i++;
-    else out._.push(argv[i]);
+    if (argv[i].startsWith('--')) {
+      const key = argv[i].slice(2);
+      const next = argv[i + 1];
+      // 布尔开关（如 --manual-images）：后面不跟值时置 true，
+      // 避免把下一个 --xxx 误当成它的值吞掉。
+      if (next === undefined || next.startsWith('--')) out[key] = true;
+      else { out[key] = next; i++; }
+    } else out._.push(argv[i]);
   }
   return out;
 }
@@ -123,145 +138,150 @@ function parseArgs(argv) {
   console.log('编辑器尺寸:', JSON.stringify(edOpen));
   if (edOpen.w === 0) throw new Error('想法编辑器激活后仍为 0 宽，未能进入编辑态');
 
-  // 1) 传图：三层 UI（经实测确定，这是「图片没上去」的真正根因链）：
-  //    L1 图片工具栏按钮（icon BUTTON，无文本）→ L2 Popover「上传图片」→ L3 Modal 内
-  //    「本地图片上传」→ 才触发 filechooser。
-  //    隐藏 input 直接 setInputFiles **完全无效**（编辑器内 0 图，走满 60s 也不落地）。
-  const picBtn = await p.evaluate(() => {
-    const ed = document.querySelector('.public-DraftEditor-content');
-    if (!ed) return null;
-    const edBox = ed.getBoundingClientRect();
-    const cands = [...document.querySelectorAll('button')].map((el) => ({ el, r: el.getBoundingClientRect() }))
-      .filter(({ r }) => r.width >= 15 && r.width <= 30 && r.height >= 15 && r.height <= 30
-        && r.x > edBox.x - 60 && r.x < edBox.x + edBox.width
-        && r.y > edBox.y - 5 && r.y < edBox.y + 180);
-    if (!cands.length) return null;
-    cands.sort((a, b) => a.r.x - b.r.x);
-    // 工具栏顺序 # / 表情 / 图片 / 视频 / 图表 —— 图片是第 3 个
-    const r = cands[Math.min(2, cands.length - 1)].r;
-    return { x: r.x + r.width / 2, y: r.y + r.height / 2, n: cands.length };
-  });
-  if (!picBtn) throw new Error('未找到图片工具栏按钮（icon 定位失败，页面改版？）');
-  console.log('L1 图片工具栏按钮:', JSON.stringify(picBtn));
-  await p.mouse.click(picBtn.x, picBtn.y);
-  await sleep(2500);
+  // 1) 传图（--manual-images 时整段跳过，见文件头说明）
+  if (!args['manual-images']) {
+    // 1) 传图：三层 UI（经实测确定，这是「图片没上去」的真正根因链）：
+    //    L1 图片工具栏按钮（icon BUTTON，无文本）→ L2 Popover「上传图片」→ L3 Modal 内
+    //    「本地图片上传」→ 才触发 filechooser。
+    //    隐藏 input 直接 setInputFiles **完全无效**（编辑器内 0 图，走满 60s 也不落地）。
+    const picBtn = await p.evaluate(() => {
+      const ed = document.querySelector('.public-DraftEditor-content');
+      if (!ed) return null;
+      const edBox = ed.getBoundingClientRect();
+      const cands = [...document.querySelectorAll('button')].map((el) => ({ el, r: el.getBoundingClientRect() }))
+        .filter(({ r }) => r.width >= 15 && r.width <= 30 && r.height >= 15 && r.height <= 30
+          && r.x > edBox.x - 60 && r.x < edBox.x + edBox.width
+          && r.y > edBox.y - 5 && r.y < edBox.y + 180);
+      if (!cands.length) return null;
+      cands.sort((a, b) => a.r.x - b.r.x);
+      // 工具栏顺序 # / 表情 / 图片 / 视频 / 图表 —— 图片是第 3 个
+      const r = cands[Math.min(2, cands.length - 1)].r;
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2, n: cands.length };
+    });
+    if (!picBtn) throw new Error('未找到图片工具栏按钮（icon 定位失败，页面改版？）');
+    console.log('L1 图片工具栏按钮:', JSON.stringify(picBtn));
+    await p.mouse.click(picBtn.x, picBtn.y);
+    await sleep(2500);
 
-  // L2: Popover「上传图片」
-  const upPos = await p.evaluate(() => {
-    const el = [...document.querySelectorAll('button,div[role=button],a,span,li')]
-      .find((x) => (x.textContent || '').trim() === '上传图片' && x.getBoundingClientRect().width > 10);
-    if (!el) return null;
-    const r = el.getBoundingClientRect();
-    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-  });
-  if (!upPos) throw new Error('L1 已点开但未找到 Popover「上传图片」（页面改版？）');
-  console.log('L2 Popover「上传图片」:', JSON.stringify(upPos));
-  await p.mouse.click(upPos.x, upPos.y);
-  await sleep(3000);
-
-  // L3: Modal 内「本地图片上传」→ filechooser
-  const localPos = await p.evaluate(() => {
-    const el = [...document.querySelectorAll('button,div[role=button],a,span,li,div')]
-      .find((x) => (x.textContent || '').trim() === '本地图片上传' && x.getBoundingClientRect().width > 10);
-    if (!el) return null;
-    const r = el.getBoundingClientRect();
-    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-  });
-  if (!localPos) throw new Error('L2 已点开但未找到 Modal「本地图片上传」（页面改版？）');
-  console.log('L3「本地图片上传」:', JSON.stringify(localPos));
-  const [chooser] = await Promise.all([
-    p.waitForEvent('filechooser', { timeout: 10000 }),
-    p.mouse.click(localPos.x, localPos.y),
-  ]);
-  await chooser.setFiles(imgs);
-  console.log(`已通过 filechooser 提交 ${count} 张图（multiple=${chooser.isMultiple()}），等待上传落编辑器…`);
-
-  // 2) 等图片上传进 Modal（正面证据 = Modal 内 blob 预览 ≥count）
-  //    然后必须**逐张点选预览图**再点「插入图片」——经实测确定：
-  //    不点选直接点「插入图片」会插入平台默认的活动推广图（一张平台自带的运营图），
-  //    用户自己的 6 张图被静默丢弃，编辑器里只剩那张活动图。
-  let modalOk = false;
-  for (let i = 0; i < 20; i++) {
+    // L2: Popover「上传图片」
+    const upPos = await p.evaluate(() => {
+      const el = [...document.querySelectorAll('button,div[role=button],a,span,li')]
+        .find((x) => (x.textContent || '').trim() === '上传图片' && x.getBoundingClientRect().width > 10);
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    });
+    if (!upPos) throw new Error('L1 已点开但未找到 Popover「上传图片」（页面改版？）');
+    console.log('L2 Popover「上传图片」:', JSON.stringify(upPos));
+    await p.mouse.click(upPos.x, upPos.y);
     await sleep(3000);
-    const st = await p.evaluate(() => {
-      const modal = document.querySelector('.Modal');
-      if (!modal) return { modal: false, blobs: 0 };
-      // blob: 预览图（每张渲染两层，阈值取一半）
-      const blobs = [...modal.querySelectorAll('img')].filter((x) => (x.currentSrc || x.src || '').startsWith('blob:')).length;
-      const hasInsert = [...modal.querySelectorAll('button')].some((b) => (b.textContent || '').trim() === '插入图片' && b.getBoundingClientRect().width > 0);
-      return { modal: true, blobs, hasInsert };
-    }).catch(() => null);
-    if (!st) continue;
-    console.log(`  t+${(i + 1) * 3}s Modal 预览 blob=${st.blobs} 插入按钮=${st.hasInsert}`);
-    if (st.blobs >= count && st.hasInsert) { modalOk = true; break; }
-  }
-  if (!modalOk) throw new Error(`图片未在 60s 内上传进 Modal 或「插入图片」按钮未出现`);
-  console.log('图片已上传进 Modal ✓');
 
-  // 逐张点选预览图（按 blob src 去重）
-  const picked = await p.evaluate((n) => {
-    const modal = document.querySelector('.Modal');
-    if (!modal) return 0;
-    const imgs = [...modal.querySelectorAll('img')].filter((x) => (x.currentSrc || x.src || '').startsWith('blob:'));
-    const seen = new Set(); const pts = [];
-    for (const im of imgs) {
-      const src = im.currentSrc || im.src;
-      if (seen.has(src)) continue;
-      seen.add(src);
-      const r = im.getBoundingClientRect();
-      if (r.width < 10) continue;
-      pts.push({ x: r.x + r.width / 2, y: r.y + r.height / 2 });
-      if (pts.length >= n) break;
+    // L3: Modal 内「本地图片上传」→ filechooser
+    const localPos = await p.evaluate(() => {
+      const el = [...document.querySelectorAll('button,div[role=button],a,span,li,div')]
+        .find((x) => (x.textContent || '').trim() === '本地图片上传' && x.getBoundingClientRect().width > 10);
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    });
+    if (!localPos) throw new Error('L2 已点开但未找到 Modal「本地图片上传」（页面改版？）');
+    console.log('L3「本地图片上传」:', JSON.stringify(localPos));
+    const [chooser] = await Promise.all([
+      p.waitForEvent('filechooser', { timeout: 10000 }),
+      p.mouse.click(localPos.x, localPos.y),
+    ]);
+    await chooser.setFiles(imgs);
+    console.log(`已通过 filechooser 提交 ${count} 张图（multiple=${chooser.isMultiple()}），等待上传落编辑器…`);
+
+    // 2) 等图片上传进 Modal（正面证据 = Modal 内 blob 预览 ≥count）
+    //    然后必须**逐张点选预览图**再点「插入图片」——经实测确定：
+    //    不点选直接点「插入图片」会插入平台默认的活动推广图（一张平台自带的运营图），
+    //    用户自己的 6 张图被静默丢弃，编辑器里只剩那张活动图。
+    let modalOk = false;
+    for (let i = 0; i < 20; i++) {
+      await sleep(3000);
+      const st = await p.evaluate(() => {
+        const modal = document.querySelector('.Modal');
+        if (!modal) return { modal: false, blobs: 0 };
+        // blob: 预览图（每张渲染两层，阈值取一半）
+        const blobs = [...modal.querySelectorAll('img')].filter((x) => (x.currentSrc || x.src || '').startsWith('blob:')).length;
+        const hasInsert = [...modal.querySelectorAll('button')].some((b) => (b.textContent || '').trim() === '插入图片' && b.getBoundingClientRect().width > 0);
+        return { modal: true, blobs, hasInsert };
+      }).catch(() => null);
+      if (!st) continue;
+      console.log(`  t+${(i + 1) * 3}s Modal 预览 blob=${st.blobs} 插入按钮=${st.hasInsert}`);
+      if (st.blobs >= count && st.hasInsert) { modalOk = true; break; }
     }
-    return pts;
-  }, count);
-  console.log(`待点选预览 ${picked.length} 张`);
-  for (const pt of picked) {
-    await p.mouse.click(pt.x, pt.y);
-    await sleep(400);
-  }
-  await sleep(1200);
-  console.log('预览图已逐张点选');
+    if (!modalOk) throw new Error(`图片未在 60s 内上传进 Modal 或「插入图片」按钮未出现`);
+    console.log('图片已上传进 Modal ✓');
 
-  // 点「插入图片」落编辑器
-  const insPos = await p.evaluate(() => {
-    const el = [...document.querySelectorAll('.Modal button, .Modal-inner button')]
-      .find((b) => (b.textContent || '').trim() === '插入图片' && b.getBoundingClientRect().width > 0);
-    if (!el) return null;
-    const r = el.getBoundingClientRect();
-    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-  });
-  if (!insPos) throw new Error('未找到「插入图片」按钮');
-  console.log('点「插入图片」:', JSON.stringify(insPos));
-  await p.mouse.click(insPos.x, insPos.y);
-  await sleep(3000);
+    // 逐张点选预览图（按 blob src 去重）
+    const picked = await p.evaluate((n) => {
+      const modal = document.querySelector('.Modal');
+      if (!modal) return 0;
+      const imgs = [...modal.querySelectorAll('img')].filter((x) => (x.currentSrc || x.src || '').startsWith('blob:'));
+      const seen = new Set(); const pts = [];
+      for (const im of imgs) {
+        const src = im.currentSrc || im.src;
+        if (seen.has(src)) continue;
+        seen.add(src);
+        const r = im.getBoundingClientRect();
+        if (r.width < 10) continue;
+        pts.push({ x: r.x + r.width / 2, y: r.y + r.height / 2 });
+        if (pts.length >= n) break;
+      }
+      return pts;
+    }, count);
+    console.log(`待点选预览 ${picked.length} 张`);
+    for (const pt of picked) {
+      await p.mouse.click(pt.x, pt.y);
+      await sleep(400);
+    }
+    await sleep(1200);
+    console.log('预览图已逐张点选');
 
-  // 3) 等图片真正落进编辑器容器
-  //    坑位⑦（经实测确定，重要）：判据必须限定在**编辑器容器内**数 <img>。
-  //    旧判据统计全页面缩略图（创作中心侧栏/推荐位有 50+ 张），恒 ≥count → 假阳性，
-  //    曾导致首次实跑报「图片已上稿 ✓」但草稿里零图。
-  let imgOk = false;
-  for (let i = 0; i < 15; i++) {
+    // 点「插入图片」落编辑器
+    const insPos = await p.evaluate(() => {
+      const el = [...document.querySelectorAll('.Modal button, .Modal-inner button')]
+        .find((b) => (b.textContent || '').trim() === '插入图片' && b.getBoundingClientRect().width > 0);
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    });
+    if (!insPos) throw new Error('未找到「插入图片」按钮');
+    console.log('点「插入图片」:', JSON.stringify(insPos));
+    await p.mouse.click(insPos.x, insPos.y);
     await sleep(3000);
-    const st = await p.evaluate(() => {
-      const ed = document.querySelector('.public-DraftEditor-content');
-      if (!ed) return { ed: false, inEd: 0 };
-      const inEd = [...ed.querySelectorAll('img')].filter((x) => (x.currentSrc || x.src || '').length > 0).length;
-      return { ed: true, inEd };
-    }).catch(() => null);
-    if (!st) continue;
-    console.log(`  t+${(i + 1) * 3}s 编辑器内图片=${st.inEd}/${count}`);
-    if (st.inEd >= count) { imgOk = true; break; }
+
+    // 3) 等图片真正落进编辑器容器
+    //    坑位⑦（经实测确定，重要）：判据必须限定在**编辑器容器内**数 <img>。
+    //    旧判据统计全页面缩略图（创作中心侧栏/推荐位有 50+ 张），恒 ≥count → 假阳性，
+    //    曾导致首次实跑报「图片已上稿 ✓」但草稿里零图。
+    let imgOk = false;
+    for (let i = 0; i < 15; i++) {
+      await sleep(3000);
+      const st = await p.evaluate(() => {
+        const ed = document.querySelector('.public-DraftEditor-content');
+        if (!ed) return { ed: false, inEd: 0 };
+        const inEd = [...ed.querySelectorAll('img')].filter((x) => (x.currentSrc || x.src || '').length > 0).length;
+        return { ed: true, inEd };
+      }).catch(() => null);
+      if (!st) continue;
+      console.log(`  t+${(i + 1) * 3}s 编辑器内图片=${st.inEd}/${count}`);
+      if (st.inEd >= count) { imgOk = true; break; }
+    }
+    if (!imgOk) {
+      const inEd = await p.evaluate(() => {
+        const ed = document.querySelector('.public-DraftEditor-content');
+        return ed ? [...ed.querySelectorAll('img')].filter((x) => (x.currentSrc || x.src || '').length > 0).length : -1;
+      }).catch(() => -1);
+      throw new Error(`图片未落编辑器：容器内只检出 ${inEd} 张（应为 ${count}）。`
+        + '注意——不能信全页面缩略图数（侧栏推荐位会造假阳性）。请人工查看页面确认。');
+    }
+    console.log('图片已上稿 ✓（编辑器容器内计数）');
+  } else {
+    console.log('⚠ --manual-images：已跳过自动配图，编辑器内无图；配图需人工在编辑器里补齐后再点发布');
   }
-  if (!imgOk) {
-    const inEd = await p.evaluate(() => {
-      const ed = document.querySelector('.public-DraftEditor-content');
-      return ed ? [...ed.querySelectorAll('img')].filter((x) => (x.currentSrc || x.src || '').length > 0).length : -1;
-    }).catch(() => -1);
-    throw new Error(`图片未落编辑器：容器内只检出 ${inEd} 张（应为 ${count}）。`
-      + '注意——不能信全页面缩略图数（侧栏推荐位会造假阳性）。请人工查看页面确认。');
-  }
-  console.log('图片已上稿 ✓（编辑器容器内计数）');
 
   // 3) 填正文（Draft.js contenteditable，必须键盘输入触发内部 state）
   const ed = await p.$('.public-DraftEditor-content, [contenteditable="true"]');
