@@ -374,6 +374,19 @@ async function kindOf(page) {
       targets.push({ slot: '横封面', file: path.resolve(args.horizontal), label: '横封面', want: '设置横封面', minRatio: 1.25, maxRatio: 1.4 });
     }
     if (!targets.length) throw new Error('缺 --vertical / --horizontal 至少一项');
+    // 硬验证的基准快照：**必须在上传之前**取。
+    // 2026-10-19 修：原实现把快照取在上传循环之后，等于拿「已落上的自定义封面」
+    // 和「已落上的自定义封面」比，src 必然相同 → 每次成功都误报「src 未变化」
+    // 并抛 FATALexit 1。封面其实早就落上了，误报会把后续步骤打断、也可能诱发
+    // 在已填页面上重跑 cover。
+    const slotSrcByWord = (word) => page.evaluate((w) => {
+      for (const el of document.querySelectorAll('[class*="coverControl"]')) {
+        if ((el.textContent || '').includes(w)) { const img = el.querySelector('img'); return img ? (img.src || '') : ''; }
+      }
+      return null;
+    }, word);
+    const srcBefore = {};
+    for (const t of targets) srcBefore[t.slot] = await slotSrcByWord(t.slot);
     for (const t of targets) {
       // 1) 点对应封面槽位打开编辑器（槽位 label「选择/编辑封面」均可点）
       //    槽位必须按文本「竖封面」/「横封面」定位，不能用 DOM 下标——2026-09-28 实测
@@ -444,14 +457,7 @@ async function kindOf(page) {
     // 6) 硬验证：槽位元素截图（视觉留档，人可复核；比例检查不可靠——默认帧裁剪比例恰好相同）。
     //    2026-10-08 加固：以「img.src 前后变化」为程序化判据（被替换成自定义图则 src 必变）——
     //    当日竖封面「已提交+已完成」输出齐全却静默回落默认帧，仅靠 slot 截图人工目检才暴露。
-    const slotSrcByWord = (word) => page.evaluate((w) => {
-      for (const el of document.querySelectorAll('[class*="coverControl"]')) {
-        if ((el.textContent || '').includes(w)) { const img = el.querySelector('img'); return img ? (img.src || '') : ''; }
-      }
-      return null;
-    }, word);
-    const srcBefore = {};
-    for (const t of targets) srcBefore[t.slot] = await slotSrcByWord(t.slot);
+    //    srcBefore 已在上传前取好（见上），此处只取 after 比对。
     const slots = page.locator('[class*="coverControl"]');
     for (let i = 0; i < await slots.count(); i++) {
       await slots.nth(i).screenshot({ path: SHOT.replace('.png', '-slot' + i + '.png'), timeout: 15000 }).catch(() => {});
@@ -461,9 +467,19 @@ async function kindOf(page) {
       const after = await slotSrcByWord(t.slot);
       const changed = !!after && after !== srcBefore[t.slot];
       if (!changed) srcFails.push(t.slot);
-      console.log((changed ? '✓' : '✗') + ' ' + t.slot + ' src ' + (changed ? '已更新（自定义图落上，DOM 验证）' : '未变化——疑似静默回落默认帧，重跑 cover 单槽补投'));
+      console.log((changed ? '✓' : '✗') + ' ' + t.slot + ' src ' + (changed ? '已更新（自定义图落上，DOM 验证）' : '未变化'));
     }
-    if (srcFails.length) throw new Error('封面槽位未落上（src 未变化）：' + srcFails.join('/') + '——slot 截图已留档，等页面空闲后重跑 cover 只带失败槽参数');
+    // src 未变化**不抛 FATAL**，只大声告警并指向槽位截图。
+    // 2026-10-19 修：原实现无脑 throw，把「已落上的自定义封面」判成失败，
+    // 打断流水线；更危险的是它会诱发在**已填好的发布页**上重跑 cover——
+    // 那正是 10-18 期「视频重传」事故的形状。这里改成告警 + 留截图给人目检：
+    // 封面最终以人为发布前的预览为准，守卫不该替你按停。
+    if (srcFails.length) {
+      console.log('⚠ 封面槽位 src 未变化：' + srcFails.join('/') + '。'
+        + '两种可能：(a) 平台静默回落默认帧（真失败）；(b) 这张封面本来就已经是当前封面（重跑场景，src 不变是正常的）。'
+        + '请目检槽位截图 ' + path.join(cfg.screenshotDir(), 'douyin-video-slot0.png') + ' / -slot1.png 确认，'
+        + '**不要盲目重跑 cover**（已填页面重跑会污染表单）。');
+    }
     console.log('槽位截图已存（' + path.join(cfg.screenshotDir(), 'douyin-video-slot0.png') + ' / -slot1.png），请目检封面内容');
   }
 
