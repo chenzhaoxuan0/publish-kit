@@ -20,6 +20,10 @@
 //       仅补选分类频道（2026-10-15 加）：复用现有 upload/channel 页，只做级联下拉这一件事，
 //       不导航、不关页、不碰视频/封面/标题/正文——交割后只想改分类时用它。
 //   --channel "<一级频道>" [--sub "<二级子频道>"]  一条龙模式下也可显式传分类（优先于 config）
+//   --keep-tabs
+//       保留所有遗留微博标签页不动，另开新页做视频（2026-10-19 加）。
+//       场景：同一账号下已有一个**已填好并交割给用户**的微博页（如九宫格图文），
+//       默认行为会把它连同已填内容一起关掉。开启后交割护栏只检查新开的这一页。
 //   --cover  传自定义封面（2026-09-21 经实测确定：微博用竖封面 3:4，非 16:9）
 //
 // ── 依赖处理方式 ────────────────────────────────────────────────────
@@ -176,11 +180,98 @@ async function selectChannel(p, channel, sub) {
   return last;
 }
 
+// ── 内容声明（2026-10-19 重写）────────────────────────────────────────
+// 旧实现按文案「请进行内容声明」去找一个弹窗里的复选框，2026-10-19 实测页面已改版：
+// 声明变成一个 wbpro-select 下拉，触发器文案就是「含AI生成内容」（灰色占位），
+// 面板里的选项文案同样是「含AI生成内容」（class _optionLabel_），末尾有「确定」按钮。
+// 旧逻辑因为找不到「请进行内容声明」而**整段静默跳过**，却照样打印「声明已补选」——
+// 假阳性。
+//
+// 三个实测坑（都已踩过）：
+// ① **不能用坐标点**：面板与表单位置随页面滚动漂移，点空/点到面板外，
+//    面板会「关掉」但值没提交（outside-click 关闭与点「确定」关闭长得一样，极易误判）。
+//    改用页面内 el.click()——面板里是 <button>，JS click 不会触发导航/表单重置。
+// ② **触发器是 toggle**：面板已开着时再点它会把面板**点关**。要先判断面板开没开。
+// ③ **不能用控件外观判读**（2026-10-19 实测）：选项文案与占位符文案完全相同
+//    （都是「含AI生成内容」），触发器灰色是组件基色、select 的 error 类也是静态类名
+//    （未填的「分类」select 同样带 error），三者都判不出真假。
+//    唯一可靠的判据是**面板里的单选态**：重开面板后目标选项仍带 _checkActive。
+async function selectStatement(p) {
+  const readPanel = () => p.evaluate(() => {
+    const panel = [...document.querySelectorAll('[class*="_panel_"]')].find((e) => /我的内容无需声明/.test(e.textContent || '') && e.getBoundingClientRect().width > 0);
+    const active = panel
+      ? [...panel.querySelectorAll('button')].filter((b) => b.querySelector('[class*="_checkActive"]')).map((b) => (b.textContent || '').trim())
+      : [];
+    return { open: !!panel, active };
+  });
+  const triggerClick = () => p.evaluate(() => {
+    const sels = [...document.querySelectorAll('.wbpro-select, [class*="wbpro-select"]')];
+    for (const s of sels) {
+      const t = s.querySelector('[class*="triggerText"]');
+      if (!t || !/AI生成/.test((t.textContent || '').trim())) continue;
+      t.click();
+      return true;
+    }
+    return false;
+  });
+
+  // 1) 打开面板（已开就别再点触发器，那是 toggle）
+  let st = await readPanel();
+  if (!st.open) {
+    if (!await triggerClick()) return { ok: false, diag: '未找到「内容声明」下拉触发器' };
+    await sleep(1500);
+    st = await readPanel();
+    if (!st.open) return { ok: false, diag: '点击触发器后面板未展开' };
+  }
+  // 2) 选目标选项（已选则不重复点）
+  if (!st.active.includes('含AI生成内容')) {
+    const r = await p.evaluate(() => {
+      const panel = [...document.querySelectorAll('[class*="_panel_"]')].find((e) => /我的内容无需声明/.test(e.textContent || '') && e.getBoundingClientRect().width > 0);
+      if (!panel) return 'no panel';
+      const b = [...panel.querySelectorAll('button')].find((x) => (x.textContent || '').trim() === '含AI生成内容');
+      if (!b) return 'no option';
+      b.click();
+      return 'clicked';
+    });
+    if (r !== 'clicked') return { ok: false, diag: '面板里未找到选项「含AI生成内容」（' + r + '）' };
+    await sleep(900);
+  }
+  // 3) 点「确定」
+  const r3 = await p.evaluate(() => {
+    const panel = [...document.querySelectorAll('[class*="_panel_"]')].find((e) => /我的内容无需声明/.test(e.textContent || '') && e.getBoundingClientRect().width > 0);
+    if (!panel) return 'no panel';
+    const b = [...panel.querySelectorAll('button')].find((x) => (x.textContent || '').trim() === '确定');
+    if (!b) return 'no confirm';
+    b.click();
+    return 'clicked';
+  });
+  if (r3 !== 'clicked') return { ok: false, diag: '面板里未找到「确定」按钮（' + r3 + '）' };
+  await sleep(1500);
+
+  // 4) 回读：重开面板，目标选项必须仍带 _checkActive（值已绑进组件）
+  await triggerClick();
+  await sleep(1400);
+  const after = await readPanel();
+  await p.keyboard.press('Escape').catch(() => {});
+  await sleep(400);
+  const ok = after.open && after.active.includes('含AI生成内容');
+  return {
+    ok,
+    diag: ok ? '' : '回读未确认（面板单选态: ' + JSON.stringify(after.active) + '）',
+    display: '含AI生成内容',
+  };
+}
+
 function parseArgs(argv) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i].startsWith('--')) out[argv[i].slice(2)] = argv[i + 1], i++;
-    else out._.push(argv[i]);
+    if (argv[i].startsWith('--')) {
+      const key = argv[i].slice(2);
+      const next = argv[i + 1];
+      // 布尔开关（如 --keep-tabs）：后面不跟值时置 true，避免吞掉下一个 --xxx
+      if (next === undefined || next.startsWith('--')) out[key] = true;
+      else { out[key] = next; i++; }
+    } else out._.push(argv[i]);
   }
   return out;
 }
@@ -195,7 +286,9 @@ function parseArgs(argv) {
   const fillOnly = sub === 'fill';
   // channel 模式（2026-10-15）：交割后只补分类频道，其余字段一律不碰。
   const channelOnly = sub === 'channel';
-  if (sub && !coverOnly && !fillOnly && !channelOnly) throw new Error('未知子命令: ' + sub);
+  // statement 模式（2026-10-19 加）：交割后只补「内容声明」，其余字段一律不碰。
+  const statementOnly = sub === 'statement';
+  if (sub && !coverOnly && !fillOnly && !channelOnly && !statementOnly) throw new Error('未知子命令: ' + sub);
   const CDP = process.env.CDP_URL || cfg.cdpUrl();
   if (coverOnly) {
     if (!args.cover || !fs.existsSync(args.cover)) throw new Error('cover 模式缺 --cover 或文件不存在');
@@ -204,6 +297,8 @@ function parseArgs(argv) {
     if (!args['body-file'] || !fs.existsSync(args['body-file'])) throw new Error('fill 模式缺 --body-file 或文件不存在');
   } else if (channelOnly) {
     if (!args.channel) throw new Error('channel 模式缺 --channel "<一级频道>"（子频道用 --sub "<二级>"）');
+  } else if (statementOnly) {
+    // statement 模式无必填参数：只补内容声明
   } else {
     if (!args.video || !fs.existsSync(args.video)) throw new Error('缺 --video 或文件不存在');
     if (!args['body-file'] || !fs.existsSync(args['body-file'])) throw new Error('缺 --body-file');
@@ -218,34 +313,50 @@ function parseArgs(argv) {
   const ctx = browser.contexts()[0];
   const weiboTabs = ctx.pages().filter((x) => /weibo\.com/.test(x.url()) && !/passport/.test(x.url()));
   let p = null;
-  if (coverOnly || fillOnly || channelOnly) {
+  if (coverOnly || fillOnly || channelOnly || statementOnly) {
     p = weiboTabs.find((x) => /upload\/channel/.test(x.url()));
-    if (!p) throw new Error((channelOnly ? 'channel' : fillOnly ? 'fill' : 'cover') + ' 模式：未找到已打开的 weibo.com/upload/channel 标签页（先跑一条龙把视频传上）');
+    if (!p) throw new Error((channelOnly ? 'channel' : statementOnly ? 'statement' : fillOnly ? 'fill' : 'cover') + ' 模式：未找到已打开的 weibo.com/upload/channel 标签页（先跑一条龙把视频传上）');
   } else {
-    // 交割护栏（2026-09-25 加固）：全量 textarea/contenteditable 检测，阈值 10 字。
-    // 旧选择器（placeholder*="新鲜事"/_input_）测不到投稿页 composer，导致遗留页旧文后追加（当日实证）。
-    if (!process.argv.includes('--force')) {
-      for (const t of weiboTabs) {
-        const filled = await t.evaluate(() => [...document.querySelectorAll('textarea, [contenteditable="true"]')]
-          .map((e) => ((e.value || e.textContent || '')).trim())
-          .filter((s) => s.length > 10)
-          .map((s) => s.slice(0, 30))).catch(() => []);
-        if (filled.length) throw new Error('[交割护栏] 微博页已有文字（疑似已交割或遗留草稿）:' + JSON.stringify(filled) + '。请人工关闭该标签页后重跑；确认页面可弃加 --force。');
+    // 2026-10-19 加 --keep-tabs：同一账号下已经有一个**已填好并交割给用户**的微博页
+    // （如九宫格图文）时，关闭遗留标签会把那个页面连同已填内容一起毁掉。
+    // --keep-tabs = 保留所有遗留标签页不动，另开新页做视频；代价是交割护栏
+    // 不能再扫全部标签（会误判已交割页），改为**只护栏新开的这一页**。
+    const keepTabs = !!args['keep-tabs'];
+    if (!keepTabs) {
+      // 交割护栏（2026-09-25 加固）：全量 textarea/contenteditable 检测，阈值 10 字。
+      // 旧选择器（placeholder*="新鲜事"/_input_）测不到投稿页 composer，导致遗留页旧文后追加（当日实证）。
+      if (!process.argv.includes('--force')) {
+        for (const t of weiboTabs) {
+          const filled = await t.evaluate(() => [...document.querySelectorAll('textarea, [contenteditable="true"]')]
+            .map((e) => ((e.value || e.textContent || '')).trim())
+            .filter((s) => s.length > 10)
+            .map((s) => s.slice(0, 30))).catch(() => []);
+          if (filled.length) throw new Error('[交割护栏] 微博页已有文字（疑似已交割或遗留草稿）:' + JSON.stringify(filled) + '。请人工关闭该标签页后重跑；确认页面可弃加 --force；若要保留已交割页请加 --keep-tabs。');
+        }
       }
+      // 全新页策略（2026-09-25）：遗留页 composer 有草稿恢复机制，reload 后旧文复活并混入新填文字——
+      // 一律关闭遗留 weibo 标签、开新页，从根上杜绝追加污染。
+      for (const t of weiboTabs) await t.close().catch(() => {});
     }
-    // 全新页策略（2026-09-25）：遗留页 composer 有草稿恢复机制，reload 后旧文复活并混入新填文字——
-    // 一律关闭遗留 weibo 标签、开新页，从根上杜绝追加污染。
-    for (const t of weiboTabs) await t.close().catch(() => {});
     p = await ctx.newPage();
     await p.goto('https://weibo.com/upload/channel', { timeout: 45000, waitUntil: 'domcontentloaded' }).catch(() => {});
     await sleep(8000);
     if (/passport\.weibo|signin|newlogin/.test(p.url())) throw new Error('微博未登录: ' + p.url());
+    if (keepTabs) {
+      // 只护栏新页：新开页若把草稿恢复出来了（旧文），同样不能让它混进新填正文
+      const filled = await p.evaluate(() => [...document.querySelectorAll('textarea, [contenteditable="true"]')]
+        .map((e) => ((e.value || e.textContent || '')).trim())
+        .filter((s) => s.length > 10)
+        .map((s) => s.slice(0, 30))).catch(() => []);
+      if (filled.length) throw new Error('[交割护栏] 新开的微博视频页已有文字（草稿恢复混入）:' + JSON.stringify(filled) + '。请人工清空该页后重跑；确认可弃加 --force。');
+      console.log('--keep-tabs：已保留 ' + weiboTabs.length + ' 个遗留微博标签页，新页护栏 ✓（无草稿恢复文字）');
+    }
   }
 
   // 1) 上传视频（2026-09-18 起：upload/channel 改为投稿表单，setInputFiles 不再触发上传，
   //    必须点「上传视频」按钮 + 拦截原生 filechooser；失败再回退 setInputFiles）
   //    cover / fill / channel 三种补投模式整段跳过（视频已在页面上）
-  if (!coverOnly && !fillOnly && !channelOnly) {
+  if (!coverOnly && !fillOnly && !channelOnly && !statementOnly) {
   const videoPath = path.resolve(args.video);
   let videoConfirmed = false;
   try {
@@ -318,7 +429,13 @@ function parseArgs(argv) {
     }
     console.log('fill 模式：检测到视频仍在页上（上传完成=' + alive.done + '，video 有 src=' + alive.vid + '），开始补填字段');
   }
-  if (!coverOnly && !channelOnly) {
+  if (!coverOnly && !channelOnly && !statementOnly) {
+  // 2026-10-19 加：titleFieldFilled —— 视频投稿表单**有**独立「标题」输入框
+  //      （2026-09-17 写脚本时按「微博无独立标题框」处理，把标题并进了正文首行）。
+  //      2026-10-19 实测 upload/channel 表单有 input[placeholder*="标题"]（maxlength 30），
+  //      标题与正文首行同时出现 = 读者看到两遍同一个标题。
+  //      所以：填了标题框 → 正文不再带标题行；没填（首页九宫格那种无标题框的表单）→ 维持并入首行。
+  let titleFieldFilled = false;
   // 1.5) 投稿表单必填项最小化补选（类型=原创、内容声明、标题）
   //      内容声明是否点选由 config.yaml 的 publish.declare_ai 决定（cfg.declareAi()，默认开）。
   //      关闭时整段跳过、不碰声明控件——平台侧是否强制要求声明由使用者自行判断，
@@ -331,26 +448,12 @@ function parseArgs(argv) {
     });
     await sleep(500);
     if (cfg.declareAi()) {
-    const declBox = await p.evaluate(() => {
-      const el = [...document.querySelectorAll('*')].filter((e) => /请进行内容声明/.test(e.textContent || '') && e.children.length <= 2).pop();
-      if (!el) return false;
-      el.click();
-      return true;
-    }).catch(() => false);
-    await sleep(1200);
-    if (declBox) {
-      await p.evaluate(() => {
-        const lab = [...document.querySelectorAll('label, [class*="checkbox"], [class*="item"], span, div')]
-          .filter((e) => /^含\s*AI\s*生成内容$/.test((e.textContent || '').trim())).pop();
-        if (lab) lab.click();
-      });
-      await sleep(600);
-      await p.evaluate(() => {
-        const btn = [...document.querySelectorAll('button')].filter((e) => (e.textContent || '').trim() === '确定').pop();
-        if (btn) btn.click();
-      });
-      await sleep(1000);
-    }
+    // 2026-10-19 重写：旧代码按「请进行内容声明」找弹窗，页面改版后找不到就**静默跳过**，
+    // 却照样打印「声明已补选」（假阳性）。现走 selectStatement()：定位下拉 → 点选项 →
+    // 点确定 → 回读控件（error 类是否消失），没选上就大声报出来。
+    const decl = await selectStatement(p);
+    if (decl.ok) console.log('内容声明已选「含AI生成内容」✓（控件回读: ' + JSON.stringify(decl.display) + '）');
+    else console.error('⚠ 内容声明未选中（' + decl.diag + '）——微博必填项，发送前请人工在下拉里选「含AI生成内容」');
     } else {
       console.log('publish.declare_ai = false，跳过内容声明（未碰声明控件；该稿件是否需要声明由你自己确认）');
     }
@@ -358,7 +461,8 @@ function parseArgs(argv) {
     if (await p.$(tSel)) {
       await p.fill(tSel, '');
       await p.fill(tSel, args.title || '');
-      console.log('投稿表单：类型/声明/标题已补选，标题 =', await p.$eval(tSel, (e) => e.value));
+      titleFieldFilled = true;
+      console.log('投稿表单：类型/标题已补选，标题 =', await p.$eval(tSel, (e) => e.value));
     }
   }
   // 2) 文字（composer textarea）
@@ -381,7 +485,8 @@ function parseArgs(argv) {
   //    微博联想为前缀替换式：未选中词残留会被后续点选整段吞掉产生碎片，故正式输入前先全量探测。
   //    候选稳定化：_item_ 候选 scrollIntoView({block:'center'}) + sleep 后双次取坐标（面板随
   //    textarea 高度浮动到视口外，坐标必须滚动后重取）。
-  const bodyNorm = text.replace(/\r\n/g, '\n').replace(/\n{2,}/g, '\n');
+  const composerSource = titleFieldFilled ? body : text;
+  const bodyNorm = composerSource.replace(/\r\n/g, '\n').replace(/\n{2,}/g, '\n');
   const main = bodyNorm.split('\n#')[0];
   const topicTags = (bodyNorm.match(/#[^\s#]+/g) || []).map((x) => x.slice(1));
   await p.keyboard.type(main, { delay: 2 });
@@ -508,6 +613,54 @@ function parseArgs(argv) {
     await p.keyboard.press('Escape');
     await sleep(500);
   }
+  // 3.15) 标签行归一化（2026-10-19 加）：微博联想点选是**前缀替换式**，与「纯文本组接尾」
+  //      混用会把尾行搅乱——2026-10-19 实测 10 个标签变成
+  //      「#Anthropic# #英伟达 # 英伟达#MiniMax# #AI# #人工智能# 人工智能 #豆包 #宇树 …」
+  //      （重复、残留 #、顺序乱）。这里做确定性归一：取最后一行 → 抽全部 #词 →
+  //      去重（保序）→ 重建为「#词 #词 …」→ 写回 textarea 并派发 input 事件（让框架收到）。
+  //      微博正文会自动把 #词 解析成话题，规整后不丢话题性。
+  const tagFix = await p.evaluate(() => {
+    const e = document.querySelector('textarea[placeholder*="新鲜事"], [contenteditable="true"]');
+    if (!e || e.value === undefined) return { skipped: true, reason: '无 textarea' };
+    const lines = e.value.split('\n');
+    let idx = -1;
+    for (let i = lines.length - 1; i >= 0; i--) { if ((lines[i] || '').trim()) { idx = i; break; } }
+    if (idx < 0) return { skipped: true, reason: '空内容' };
+    const last = lines[idx];
+    if (!/#/.test(last)) return { skipped: true, reason: '末行无标签' };
+    const seen = new Set(); const tags = [];
+    for (const m of last.matchAll(/#([^\s#]+)/g)) {
+      const t = (m[1] || '').trim();
+      if (!t || seen.has(t)) continue;
+      seen.add(t); tags.push(t);
+    }
+    if (!tags.length) return { skipped: true, reason: '抽不出标签' };
+    const rebuilt = '#' + tags.join(' #');
+    // ⚠ 只替换**标签部分**：微博联想的前缀替换会把结尾段和标签挤到同一行，
+    //   整行替换会把结尾段一起吃掉（2026-10-19 实测踩到）。
+    const at = last.indexOf('#');
+    const head = at >= 0 ? last.slice(0, at) : '';
+    const nextLine = head + rebuilt;
+    if (last === nextLine) return { ok: true, unchanged: true, tags };
+    lines[idx] = nextLine;
+    e.value = lines.join('\n');
+    e.dispatchEvent(new Event('input', { bubbles: true }));
+    return { ok: true, tags, before: last.slice(0, 140), after: nextLine };
+  });
+  if (tagFix && tagFix.ok) {
+    await sleep(600);
+    const tail = await p.evaluate(() => {
+      const e = document.querySelector('textarea[placeholder*="新鲜事"], [contenteditable="true"]');
+      if (!e || e.value === undefined) return null;
+      const ls = e.value.split('\n');
+      for (let i = ls.length - 1; i >= 0; i--) { if ((ls[i] || '').trim()) return ls[i]; }
+      return null;
+    });
+    const ok = tail === tagFix.after;
+    console.log((ok ? '✓' : '✗') + ' 标签行归一化: ' + JSON.stringify(tagFix.tags) + (ok ? '' : '（回读不一致: ' + JSON.stringify(tail) + '）'));
+  } else if (tagFix && tagFix.skipped) {
+    console.log('标签行归一化跳过: ' + tagFix.reason);
+  }
   // 回读自证（2026-09-30 加）：文字主体+话题全部输入后，回读 composer 实际内容，
   // 长度不达标即 FATAL——防止「文字已填」假阳性（09-30 期正文全丢仍报成功）。
   const verify = await p.evaluate(() => {
@@ -548,6 +701,18 @@ function parseArgs(argv) {
       process.exit(1);
     }
     console.log('分类频道已选（' + args.channel + (r.clicked2 ? ' / ' + r.clicked2 : '') + '，控件回读: ' + r.display + '）✓');
+    console.log('STATUS: 已停在「发送」按钮前，等待用户点击发送');
+    process.exit(0);
+  }
+  if (statementOnly) {
+    // statement 模式到此为止：只做「内容声明」这一件事，不碰视频/封面/标题/正文/分类。
+    const r = await selectStatement(p);
+    // 先报结果再截图：微博页重，截图可能超时，不能让它盖掉真正的错误
+    if (!r.ok) console.error('FATAL 内容声明未选中（' + r.diag + '）——请人工在「内容声明」下拉里选「含AI生成内容」');
+    else console.log('内容声明已选「含AI生成内容」✓（控件回读: ' + JSON.stringify(r.display) + '）');
+    await p.screenshot({ path: SHOT, timeout: 15000 }).catch((e) => console.log('截图失败（' + String(e.message || e).slice(0, 60) + '），跳过留档'));
+    console.log('screenshot →', SHOT);
+    if (!r.ok) process.exit(1);
     console.log('STATUS: 已停在「发送」按钮前，等待用户点击发送');
     process.exit(0);
   }

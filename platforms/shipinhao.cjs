@@ -49,6 +49,9 @@
 //   2) 2026-09-21 实测封面：点「编辑」→ 弹窗图片 input 直接 setInputFiles → 「确认」。
 //   3) 2026-09-29 加固发表页：/platform/post/create 改版后微应用挂载慢且会重挂，
 //      固定等待后 setInputFiles 连续撞 detached——竞态类错误重试 3 轮。
+//   4) 2026-10-19 描述回读闭环：描述含 # 会触发话题联想，平台可能把词顶替成热榜话题
+//      （知乎同类编辑器已实证）。描述步改为「type → 回读比对 → 不一致就地清空重灌
+//      （insertText）→ 再回读」，仍不一致则抛错，**任何情况下都不重传视频**。
 const fs = require('fs');
 const path = require('path');
 const cfg = require('../lib/config.cjs');
@@ -214,7 +217,19 @@ function checkTitle(t) {
   await editor.waitFor({ state: 'visible', timeout: 300000 });
   await sleep(2000);
 
-  // 4) 描述：点击聚焦后逐字输入（含 #话题），输完点空白处收起联想
+  // 4) 描述：点击聚焦后输入（含 #话题），输完点空白处收起联想
+  //    2026-10-19 加固：逐字 keyboard.type 时，描述里的「#」会触发话题联想面板，
+  //    平台可能把我们打的词顶替成热榜话题（知乎同类编辑器已实证：「#英伟达」→「#书单推荐」，
+  //    10 个标签被污染成 2 个 + 8 个「#自制美食」）。所以这里改成
+  //    「先 type、再回读比对；对不上就地清空重灌（insertText 一次性插入，不触发联想）」，
+  //    全程不重传视频。回读不一致又不修好就抛错，绝不带脏描述交割。
+  const readDesc = () => p.evaluate(() => {
+    const wj = document.querySelector('wujie-app');
+    const box = wj && wj.shadowRoot ? wj.shadowRoot.querySelector('.input-editor') : null;
+    const el = box || document.querySelector('.input-editor');
+    return el ? (el.innerText || '').replace(/\u200b/g, '') : '';
+  }).catch(() => '');
+  const normDesc = (s) => (s || '').replace(/\u200b/g, '').replace(/\s+/g, '');
   await editor.click({ timeout: 8000 });
   await sleep(600);
   await p.keyboard.type(body, { delay: 8 });
@@ -222,6 +237,27 @@ function checkTitle(t) {
   await sleep(1200);
   await p.mouse.click(400, 400);
   await sleep(800);
+  let descNow = await readDesc();
+  if (!normDesc(descNow).includes(normDesc(body))) {
+    console.log('⚠ 描述回读与给定正文不一致（疑似话题联想面板把词顶替了）——就地清空重灌，不重传视频');
+    await editor.click({ timeout: 8000 });
+    await sleep(400);
+    await p.keyboard.press('Control+A');
+    await sleep(300);
+    await p.keyboard.press('Delete');
+    await sleep(600);
+    await p.keyboard.insertText(body);
+    await sleep(1500);
+    await p.mouse.click(400, 400);
+    await sleep(800);
+    descNow = await readDesc();
+    console.log('重灌后描述长度:', descNow.length);
+  }
+  if (!normDesc(descNow).includes(normDesc(body))) {
+    throw new Error('描述回读不一致：编辑器内容与给定正文不匹配（期望尾部 ' + JSON.stringify(normDesc(body).slice(-60))
+      + '，实际尾部 ' + JSON.stringify(normDesc(descNow).slice(-60)) + '）。请人工检查页面，勿直接发表。');
+  }
+  console.log('描述回读校验 ✓（与给定正文一致，未被平台改写）');
 
   } // end !coverOnly&&!fixMode（上传与描述步整体，cover/fix 模式直达后续段）
 
