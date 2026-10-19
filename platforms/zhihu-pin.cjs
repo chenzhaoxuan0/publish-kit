@@ -8,7 +8,8 @@
 //                              [--title "标题并入首行"] [--force]
 //   --media      图片目录，按 img-01.png 起连续命名
 //   --body-file  纯文本正文文件
-//   --title      并入正文首行
+//   --title      标题：默认填「标题」字段（想法 V2 表单的 name="title" textarea）
+//   --title-in-body  退回旧行为：标题并入正文首行（默认不启用）
 //   --count      实际张数（默认 6）
 //   --force      跳过「交割护栏」。护栏检测到页面上已有文字就中止，是为了不污染真实发布页。
 //   --manual-images
@@ -49,6 +50,12 @@
 //      侧栏推荐位会造假阳性——曾因此「图片已上稿 ✓」而草稿里零图。
 //   ⑧ 自动传图链路目前**跑不通**（编辑器容器内恒 0 图）。--manual-images 是降级出路：
 //      跳过整段配图，只填正文停在「发布」前，人工补图。详见 image-post-flow.md。
+//   ⑨ 想法 V2 表单有 TitleArea > textarea[name="title"]（maxLength=-1、非必填）。
+//      标题应填这个字段，正文首行不要重复标题。
+//   ⑩ 正文必须用 keyboard.insertText 插入，**不能**用 keyboard.type 逐字打：
+//      每敲一个「#」都会弹出知乎话题联想面板，平台会把我们打的词顶替成热榜话题
+//      （实测「#英伟达 」→「#书单推荐」，DOM 里还落成 <a class="zed-topic">），
+//      正文被静默污染。insertText 不派发按键，联想面板不触发。
 const fs = require('fs');
 const path = require('path');
 const cfg = require('../lib/config.cjs');
@@ -78,14 +85,18 @@ function parseArgs(argv) {
   if (!args.media) throw new Error('缺 --media <dir>');
   if (!args['body-file'] || !fs.existsSync(args['body-file'])) throw new Error('缺 --body-file');
   const body = fs.readFileSync(path.resolve(args['body-file']), 'utf-8').trim();
-  const text = args.title ? `${args.title}\n${body}` : body;
+  // 标题落位（坑位⑨）：想法 V2 表单有 name="title" 的 textarea，标题应填那里，
+  // 正文首行不再重复标题。--title-in-body 可退回旧行为（标题并入正文首行）。
+  const title = args.title ? String(args.title) : '';
+  const titleInBody = !!args['title-in-body'];
+  let text = titleInBody && title ? `${title}\n${body}` : body;
   const count = parseInt(args.count || '6', 10);
   const media = path.resolve(args.media);
   const imgs = Array.from({ length: count }, (_, i) => path.join(media, `img-${String(i + 1).padStart(2, '0')}.png`));
   imgs.forEach((f) => { if (!fs.existsSync(f)) throw new Error('图片缺失: ' + f); });
   // 物料守卫：正文出现 undefined/NaN 即 FATAL（曾经有上游生成脚本的 bug 把「undefined。」
   // 一路推进真实发布页，返工要删稿重发，这个洞不值得再踩一次）
-  if (/undefined|NaN|\[object Object\]/.test(text)) throw new Error('[物料守卫] 正文含 undefined/NaN，先修文件再发');
+  if (/undefined|NaN|\[object Object\]/.test(title + text)) throw new Error('[物料守卫] 正文含 undefined/NaN，先修文件再发');
 
   const browser = await chromium.connectOverCDP(process.env.CDP_URL || cfg.cdpUrl(), { timeout: 15000 });
   const ctx = browser.contexts()[0];
@@ -137,6 +148,23 @@ function parseArgs(argv) {
   });
   console.log('编辑器尺寸:', JSON.stringify(edOpen));
   if (edOpen.w === 0) throw new Error('想法编辑器激活后仍为 0 宽，未能进入编辑态');
+
+  // 0.5) 标题落「标题」字段（坑位⑨）
+  //     想法 V2 表单里 TitleArea > textarea[name="title"]，maxLength=-1（非必填）。
+  //     标题填这里，正文首行不再重复；找不到这个框才退回「标题并入正文首行」。
+  if (title && !titleInBody) {
+    const ta = await p.$('textarea[name="title"], textarea[placeholder="标题"]');
+    if (ta) {
+      await ta.fill(title);
+      await sleep(600);
+      const v = await ta.inputValue().catch(() => '');
+      console.log('标题字段已填:', JSON.stringify(v), v === title ? '✓' : '✗ 回读不一致');
+      if (v !== title) throw new Error('标题字段回读不一致，疑似 React 未接收（填的是 "' + v + '"）');
+    } else {
+      text = `${title}\n${text}`;
+      console.log('⚠ 未找到「标题」输入框，标题退回并入正文首行');
+    }
+  }
 
   // 1) 传图（--manual-images 时整段跳过，见文件头说明）
   if (!args['manual-images']) {
@@ -283,7 +311,13 @@ function parseArgs(argv) {
     console.log('⚠ --manual-images：已跳过自动配图，编辑器内无图；配图需人工在编辑器里补齐后再点发布');
   }
 
-  // 3) 填正文（Draft.js contenteditable，必须键盘输入触发内部 state）
+  // 3) 填正文（Draft.js contenteditable）
+  //    坑位⑩（经实测确定，重要）：**必须用 insertText，不能用 keyboard.type**。
+  //    逐字 type 时，每次输入「#」都会弹出知乎话题联想面板，平台会把我们打的词
+  //    顶替成热榜话题——实测「#英伟达 」变成「#书单推荐」，并在 DOM 里落成
+  //    <a class="zed-topic" data-topic-id="1352443">，正文被静默污染。
+  //    insertText 一次性插入、不派发按键，联想面板不触发，实测标签原样保留、
+  //    \n 也正常成块。
   const ed = await p.$('.public-DraftEditor-content, [contenteditable="true"]');
   if (!ed) throw new Error('未找到想法编辑器（.public-DraftEditor-content）');
   // 用坐标点击（编辑器激活后可能有动画，直接 click 也可，但坐标法更稳）
@@ -298,13 +332,24 @@ function parseArgs(argv) {
   if (edPos && edPos.w > 0) await p.mouse.click(edPos.x, edPos.y);
   else await ed.click({ timeout: 8000 }).catch(() => {});
   await sleep(600);
-  await p.keyboard.type(text, { delay: 2 });
-  await sleep(1500);
+  await p.keyboard.insertText(text);
+  await sleep(1800);
   const state = await p.evaluate(() => {
     const e = document.querySelector('.public-DraftEditor-content, [contenteditable="true"]');
-    return { len: e ? (e.innerText || '').replace(/\u200b/g, '').trim().length : 0, head: e ? (e.innerText || '').slice(0, 40) : '' };
+    const full = e ? (e.innerText || '').replace(/\u200b/g, '') : '';
+    return { len: full.trim().length, head: full.slice(0, 40), full, tail: full.slice(-120) };
   });
   console.log(`正文已填 ${state.len} 字（首行: ${state.head.replace(/\n/g, ' ')}）`);
+  console.log('正文尾部:', JSON.stringify(state.tail));
+  // 回读校验：去掉全部空白后，我们给的正文必须原样出现在编辑器里。
+  // 少了 = 被平台改写（联想面板顶替 / 截断），必须在这里就炸掉，不能带着脏稿交割。
+  const norm = (s) => (s || '').replace(/\u200b/g, '').replace(/\s+/g, '');
+  if (!norm(state.full).includes(norm(text))) {
+    throw new Error('正文回读不一致：编辑器内容与我们给的正文不匹配（可能被平台改写或截断）。'
+      + '\n  期望尾部: ' + JSON.stringify(norm(text).slice(-80))
+      + '\n  实际尾部: ' + JSON.stringify(norm(state.full).slice(-80)));
+  }
+  console.log('正文回读校验 ✓（与给定正文一致，未被平台改写）');
 
   // 4) 契约：停「发布」前
   //    坑位⑥（经实测确定）：编辑态下真正的发布按钮文案是「发布」，
