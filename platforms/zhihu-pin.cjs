@@ -13,12 +13,9 @@
 //   --count      实际张数（默认 6）
 //   --force      跳过「交割护栏」。护栏检测到页面上已有文字就中止，是为了不污染真实发布页。
 //   --manual-images
-//                跳过自动配图（默认不启用）。自动传图链路有个未解缺陷：
-//                Modal 内点「插入图片」后，落进编辑器的可能是平台默认活动推广图，
-//                用户自己的图被静默丢弃，容器内仍是 0 图（详见 04_skills/
-//                news-publisher/image-post-flow.md 的「未解」条）。
-//                打开后只自动填正文、截图、停在「发布」前，配图由人工在编辑器里补。
-//                ——这是**降级**开关，不是修复；将来链路修通后应删掉它。
+//                跳过自动配图，只自动填正文、截图、停在「发布」前，配图由人工在编辑器里补
+//                （默认不启用）。自动传图链路 2026-10-19 晚已修通，根因是**判据数错了容器**
+//                （见坑位⑦⑧），不是上传失败。
 //
 // 流程：https://www.zhihu.com/creator 创作中心 → 「分享此刻的想法…」编辑器（常驻页面）
 //   → 点工具栏图片按钮 → 三层 UI 上传 → 逐张点选预览 → 「插入图片」
@@ -46,10 +43,16 @@
 //      不先点「分享此刻的想法…」进编辑态，click 会 30s 超时 invisible。
 //   ⑥ 编辑态下真正的发布按钮文案是「发布」，「发想法」是未激活态那个 0 宽的占位按钮（w:0）。
 //      别按「发想法」找。
-//   ⑦ 图片落稿的判据必须限定在编辑器容器内数 <img>；全页面缩略图统计恒 ≥count，
-//      侧栏推荐位会造假阳性——曾因此「图片已上稿 ✓」而草稿里零图。
-//   ⑧ 自动传图链路目前**跑不通**（编辑器容器内恒 0 图）。--manual-images 是降级出路：
-//      跳过整段配图，只填正文停在「发布」前，人工补图。详见 image-post-flow.md。
+//   ⑦ **知乎想法的图不在 Draft.js 编辑器容器里**。上传成功后图落在编辑器**上方**的
+//      独立图集区：div.DraggableTags > .DraggableTags-tag > img（src 是
+//      pic-private.zhihu.com，草稿态私有 CDN，natural 尺寸=原图，如 1440x1920）。
+//      判据必须数**图集区**里的 <img> 并按 src 去重：
+//        ✗ 数 .public-DraftEditor-content 内的 <img> → 恒 0（旧判据，误报「未落稿」）
+//        ✗ 数全页缩略图 → 恒 ≥count，侧栏推荐位造假阳性
+//      10-19 期就是这个错判据导致误以为「传图链路不通」，白降级了一期人工补图。
+//   ⑧ 判据还要**逐张对上源图**：读 PNG 头拿每张源图的宽高，图集里必须能一一匹配
+//      （宽高全等优先，退而求其次宽高比一致），否则「平台默认活动推广图顶替了我的图」
+//      这类假阳性照样漏过。
 //   ⑨ 想法 V2 表单有 TitleArea > textarea[name="title"]（maxLength=-1、非必填）。
 //      标题应填这个字段，正文首行不要重复标题。
 //   ⑩ 正文必须用 keyboard.insertText 插入，**不能**用 keyboard.type 逐字打：
@@ -80,6 +83,44 @@ function parseArgs(argv) {
   return out;
 }
 
+// PNG 头读宽高（不引第三方依赖）：源图尺寸是「图到底落没落对」的关键判据（坑位⑧）
+function readPngSize(file) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(24);
+    fs.readSync(fd, buf, 0, 24, 0);
+    if (buf.readUInt32BE(0) !== 0x89504e47) return null;   // 不是 PNG
+    const w = buf.readUInt32BE(16), h = buf.readUInt32BE(20);
+    return (w > 0 && h > 0) ? { w, h, ratio: w / h } : null;
+  } catch (e) { return null; } finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+
+// 把图集里的图与源图一一对上：优先「宽高完全相同」，其次「宽高比一致」
+// 返回 { exact, ratio, matched, missing } —— missing>0 = 有源图没找到对应落稿图
+function matchStripToSources(items, srcDims) {
+  const used = new Set();
+  let exact = 0, ratio = 0;
+  const dims = srcDims.filter(Boolean);
+  for (const d of dims) {
+    let hit = -1;
+    for (let i = 0; i < items.length; i++) {
+      if (used.has(i)) continue;
+      const it = items[i];
+      if (it && it.w === d.w && it.h === d.h) { hit = i; break; }
+    }
+    if (hit >= 0) { used.add(hit); exact++; continue; }
+    for (let i = 0; i < items.length; i++) {
+      if (used.has(i)) continue;
+      const it = items[i];
+      if (!it || !it.w || !it.h) continue;
+      if (Math.abs(it.w / it.h - d.ratio) / d.ratio < 0.01) { hit = i; break; }
+    }
+    if (hit >= 0) { used.add(hit); ratio++; }
+  }
+  return { exact, ratio, matched: exact + ratio, missing: dims.length - exact - ratio };
+}
+
 (async () => {
   const args = parseArgs(process.argv.slice(2));
   if (!args.media) throw new Error('缺 --media <dir>');
@@ -94,6 +135,10 @@ function parseArgs(argv) {
   const media = path.resolve(args.media);
   const imgs = Array.from({ length: count }, (_, i) => path.join(media, `img-${String(i + 1).padStart(2, '0')}.png`));
   imgs.forEach((f) => { if (!fs.existsSync(f)) throw new Error('图片缺失: ' + f); });
+  // 源图宽高：后面「图落对了没」的判据要用（坑位⑧）
+  const srcDims = imgs.map((f) => readPngSize(f));
+  const noDim = srcDims.filter((d) => !d).length;
+  if (noDim) console.log(`⚠ ${noDim}/${count} 张源图读不到尺寸（非 PNG？），判据退化为宽高比`);
   // 物料守卫：正文出现 undefined/NaN 即 FATAL（曾经有上游生成脚本的 bug 把「undefined。」
   // 一路推进真实发布页，返工要删稿重发，这个洞不值得再踩一次）
   if (/undefined|NaN|\[object Object\]/.test(title + text)) throw new Error('[物料守卫] 正文含 undefined/NaN，先修文件再发');
@@ -173,6 +218,21 @@ function parseArgs(argv) {
     }
   }
 
+  // 图集区读数（坑位⑦）：知乎想法的图在编辑器**上方**的 div.DraggableTags 里，
+  //   不在 .public-DraftEditor-content 里。按 src 去重（每张图渲染两层）。
+  const readStrip = () => p.evaluate(() => {
+    const strip = document.querySelector('.DraggableTags');
+    const scope = strip || document.querySelector('.WriteArea') || document.body;
+    const seen = new Map();
+    for (const im of scope.querySelectorAll('img')) {
+      const src = im.currentSrc || im.src || '';
+      if (!src || !im.naturalWidth || im.naturalWidth < 200) continue;   // 头像/图标不算
+      const key = src.split('?')[0];
+      if (!seen.has(key)) seen.set(key, { w: im.naturalWidth, h: im.naturalHeight, box: Math.round(im.getBoundingClientRect().width) });
+    }
+    return { hasStrip: !!strip, total: seen.size, items: [...seen.values()] };
+  });
+
   // 1) 传图（--manual-images 时整段跳过，见文件头说明）
   if (!args['manual-images']) {
     // 1) 传图：三层 UI（经实测确定，这是「图片没上去」的真正根因链）：
@@ -250,32 +310,50 @@ function parseArgs(argv) {
     if (!modalOk) throw new Error(`图片未在 60s 内上传进 Modal 或「插入图片」按钮未出现`);
     console.log('图片已上传进 Modal ✓');
 
-    // 逐张点选预览图（按 blob src 去重）
-    const picked = await p.evaluate((n) => {
+    // 逐张点选预览图（按 blob src 去重；每张先滚进视口再点，8 张时网格会滚动）
+    const blobSrcs = await p.evaluate(() => {
       const modal = document.querySelector('.Modal');
-      if (!modal) return 0;
-      const imgs = [...modal.querySelectorAll('img')].filter((x) => (x.currentSrc || x.src || '').startsWith('blob:'));
-      const seen = new Set(); const pts = [];
-      for (const im of imgs) {
-        const src = im.currentSrc || im.src;
+      if (!modal) return [];
+      const seen = new Set(); const out = [];
+      for (const im of modal.querySelectorAll('img')) {
+        const src = im.currentSrc || im.src || '';
+        if (!src.startsWith('blob:')) continue;
         if (seen.has(src)) continue;
         seen.add(src);
-        const r = im.getBoundingClientRect();
-        if (r.width < 10) continue;
-        pts.push({ x: r.x + r.width / 2, y: r.y + r.height / 2 });
-        if (pts.length >= n) break;
+        out.push(src);
       }
-      return pts;
-    }, count);
-    console.log(`待点选预览 ${picked.length} 张`);
-    for (const pt of picked) {
+      return out;
+    });
+    const pickN = Math.min(blobSrcs.length, count);
+    console.log(`待点选预览 ${pickN} 张（Modal 内 blob 预览共 ${blobSrcs.length} 张）`);
+    for (let i = 0; i < pickN; i++) {
+      const ok = await p.evaluate((src) => {
+        const modal = document.querySelector('.Modal');
+        if (!modal) return false;
+        const im = [...modal.querySelectorAll('img')].find((x) => (x.currentSrc || x.src || '') === src);
+        if (!im) return false;
+        im.scrollIntoView({ block: 'center' });
+        return true;
+      }, blobSrcs[i]).catch(() => false);
+      if (!ok) continue;
+      await sleep(200);
+      const pt = await p.evaluate((src) => {
+        const modal = document.querySelector('.Modal');
+        if (!modal) return null;
+        const im = [...modal.querySelectorAll('img')].find((x) => (x.currentSrc || x.src || '') === src);
+        if (!im) return null;
+        const r = im.getBoundingClientRect();
+        if (r.width < 10) return null;
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      }, blobSrcs[i]).catch(() => null);
+      if (!pt) continue;
       await p.mouse.click(pt.x, pt.y);
-      await sleep(400);
+      await sleep(350);
     }
     await sleep(1200);
     console.log('预览图已逐张点选');
 
-    // 点「插入图片」落编辑器
+    // 点「插入图片」→ 图落进**图集区**（不是编辑器容器，见坑位⑦）
     const insPos = await p.evaluate(() => {
       const el = [...document.querySelectorAll('.Modal button, .Modal-inner button')]
         .find((b) => (b.textContent || '').trim() === '插入图片' && b.getBoundingClientRect().width > 0);
@@ -288,34 +366,27 @@ function parseArgs(argv) {
     await p.mouse.click(insPos.x, insPos.y);
     await sleep(3000);
 
-    // 3) 等图片真正落进编辑器容器
-    //    坑位⑦（经实测确定，重要）：判据必须限定在**编辑器容器内**数 <img>。
-    //    旧判据统计全页面缩略图（创作中心侧栏/推荐位有 50+ 张），恒 ≥count → 假阳性，
-    //    曾导致首次实跑报「图片已上稿 ✓」但草稿里零图。
-    let imgOk = false;
-    for (let i = 0; i < 15; i++) {
-      await sleep(3000);
-      const st = await p.evaluate(() => {
-        const ed = document.querySelector('.public-DraftEditor-content');
-        if (!ed) return { ed: false, inEd: 0 };
-        const inEd = [...ed.querySelectorAll('img')].filter((x) => (x.currentSrc || x.src || '').length > 0).length;
-        return { ed: true, inEd };
-      }).catch(() => null);
+    // 3) 等图片真正落进**图集区**
+    //    坑位⑦：图不在 Draft.js 编辑器容器里，在编辑器上方的 div.DraggableTags。
+    //    旧判据数编辑器容器 → 恒 0 → 误判「没传上去」（10-19 期据此误降级成人工补图）。
+    //    坑位⑧：还要逐张对上源图宽高，防止「平台默认活动图顶替了我的图」。
+    let imgOk = false, strip = { total: 0, items: [] }, m = { exact: 0, ratio: 0, matched: 0, missing: count };
+    for (let i = 0; i < 20; i++) {
+      await sleep(2000);
+      const st = await readStrip().catch(() => null);
       if (!st) continue;
-      console.log(`  t+${(i + 1) * 3}s 编辑器内图片=${st.inEd}/${count}`);
-      if (st.inEd >= count) { imgOk = true; break; }
+      strip = st;
+      m = matchStripToSources(strip.items, srcDims);
+      console.log(`  t+${(i + 1) * 2}s 图集=${strip.total} 张，与源图匹配=${m.matched}/${count}（宽高全等 ${m.exact} / 仅比例一致 ${m.ratio}）`);
+      if (m.missing === 0 && m.matched >= count) { imgOk = true; break; }
     }
     if (!imgOk) {
-      const inEd = await p.evaluate(() => {
-        const ed = document.querySelector('.public-DraftEditor-content');
-        return ed ? [...ed.querySelectorAll('img')].filter((x) => (x.currentSrc || x.src || '').length > 0).length : -1;
-      }).catch(() => -1);
-      throw new Error(`图片未落编辑器：容器内只检出 ${inEd} 张（应为 ${count}）。`
-        + '注意——不能信全页面缩略图数（侧栏推荐位会造假阳性）。请人工查看页面确认。');
+      throw new Error(`图片未落图集区：检出 ${strip.total} 张，与源图匹配 ${m.matched}/${count}（缺 ${m.missing}）。`
+        + '请人工查看页面确认（下方截图已留档）。');
     }
-    console.log('图片已上稿 ✓（编辑器容器内计数）');
+    console.log(`图片已上稿 ✓（图集区 ${strip.total} 张，与 ${count} 张源图匹配：宽高全等 ${m.exact} / 仅比例一致 ${m.ratio}）`);
   } else {
-    console.log('⚠ --manual-images：已跳过自动配图，编辑器内无图；配图需人工在编辑器里补齐后再点发布');
+    console.log('⚠ --manual-images：已跳过自动配图，图集区为空；配图需人工补齐后再点发布');
   }
 
   // 3) 填正文（Draft.js contenteditable）
@@ -357,6 +428,16 @@ function parseArgs(argv) {
       + '\n  实际尾部: ' + JSON.stringify(norm(state.full).slice(-80)));
   }
   console.log('正文回读校验 ✓（与给定正文一致，未被平台改写）');
+
+  // 3.5) 收尾复核：填完正文后图集区仍在位（正文输入不该把已传图清掉）
+  if (!args['manual-images']) {
+    const s2 = await readStrip().catch(() => null);
+    if (s2) {
+      const m2 = matchStripToSources(s2.items, srcDims);
+      console.log(`收尾复核：图集 ${s2.total} 张，与源图匹配 ${m2.matched}/${count}（宽高全等 ${m2.exact}）`);
+      if (m2.missing !== 0) throw new Error('填完正文后图集区对不上源图了（可能正文输入清掉了图），请人工确认。');
+    }
+  }
 
   // 4) 契约：停「发布」前
   //    坑位⑥（经实测确定）：编辑态下真正的发布按钮文案是「发布」，
