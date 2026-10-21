@@ -487,11 +487,31 @@ function parseArgs(argv) {
   //    textarea 高度浮动到视口外，坐标必须滚动后重取）。
   const composerSource = titleFieldFilled ? body : text;
   const bodyNorm = composerSource.replace(/\r\n/g, '\n').replace(/\n{2,}/g, '\n');
+  // ⚠️ 2026-10-22：微博话题的**本体就是 #tag#**（两个 # 包裹）——
+  //   单 # 写进正文服务端**不认**，发布出来是死文本（这是已发布微博里 tag 失效的根因）；
+  //   写成 #tag# 就不必联想点选，服务端自己按 #tag# 认成话题。
+  //   所以 **#tag# 新格式走「原样输入」路径**：整体 fill（不派发按键 → 不触发联想面板的
+  //   「前缀替换」把标签搅乱），并**跳过**下面的两轮点选与标签行归一化
+  //   （归一化会把 #tag# 重建回单 #，等于把修复又打回去）。
+  //   老格式（单 #）保持原逻辑不动。
+  const wrappedTags = /#[^\s#]+#/.test(bodyNorm);
   const main = bodyNorm.split('\n#')[0];
-  const topicTags = (bodyNorm.match(/#[^\s#]+/g) || []).map((x) => x.slice(1));
-  await p.keyboard.type(main, { delay: 2 });
-  await p.keyboard.press('Control+End');
-  await sleep(300);
+  const topicTags = wrappedTags ? [] : (bodyNorm.match(/#[^\s#]+/g) || []).map((x) => x.slice(1));
+  if (wrappedTags) {
+    const ta0 =
+      (await p.$('textarea[placeholder*="新鲜事"], textarea._input_1rz8r_8')) || (await p.$('textarea'));
+    if (!ta0) throw new Error('未找到 composer textarea');
+    await ta0.fill(bodyNorm);
+    await sleep(1500);
+    const len0 = await ta0.inputValue();
+    console.log(
+      `文字已填（#tag# 原样输入，回读 ${len0.length} 字；服务端按 #tag# 识别话题，不做联想点选）`
+    );
+  } else {
+    await p.keyboard.type(main, { delay: 2 });
+    await p.keyboard.press('Control+End');
+    await sleep(300);
+  }
   const findCand = async (kw) => {
     for (let i = 0; i < 6; i++) {
       await sleep(1000);
@@ -619,7 +639,10 @@ function parseArgs(argv) {
   //      （重复、残留 #、顺序乱）。这里做确定性归一：取最后一行 → 抽全部 #词 →
   //      去重（保序）→ 重建为「#词 #词 …」→ 写回 textarea 并派发 input 事件（让框架收到）。
   //      微博正文会自动把 #词 解析成话题，规整后不丢话题性。
-  const tagFix = await p.evaluate(() => {
+  //      ⚠️ 2026-10-22：#tag# 新格式**跳过归一化** —— 它重建的是单 #，
+  //         会把「服务端认话题的 #tag#」又打回死文本。
+  const tagFix = await p.evaluate((wrapped) => {
+    if (wrapped) return { skipped: true, reason: '#tag# 格式，服务端直接认，不归一化' };
     const e = document.querySelector('textarea[placeholder*="新鲜事"], [contenteditable="true"]');
     if (!e || e.value === undefined) return { skipped: true, reason: '无 textarea' };
     const lines = e.value.split('\n');
@@ -646,7 +669,7 @@ function parseArgs(argv) {
     e.value = lines.join('\n');
     e.dispatchEvent(new Event('input', { bubbles: true }));
     return { ok: true, tags, before: last.slice(0, 140), after: nextLine };
-  });
+  }, wrappedTags);
   if (tagFix && tagFix.ok) {
     await sleep(600);
     const tail = await p.evaluate(() => {

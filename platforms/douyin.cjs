@@ -236,43 +236,188 @@ async function kindOf(page) {
     await page.waitForTimeout(500);
     await page.keyboard.type(title ? main : `${args.title}\n${main}`, { delay: 3 });
     console.log('描述正文已填');
-    await page.keyboard.press('End');
+    // 话题：**单轮 + 精确回删**（2026-10-22 重写）
+    // ⚠️ 2026-10-22 实测报障（用户：「最后几个 tag 是混乱状态」）：
+    //    10-21 期实测尾部是「#Anthropic #SpaceX #OpenAI #ChatGPT #v#AA大人AI日报人人工
+    //    智能大模型AAILLLM」——前 4 个是干净 chip，后面全是交织碎片。
+    //    上一版的「两轮法」（探测轮 → 正式轮 → 纯文本接尾）**实测彻底失败**：
+    //    探测轮 10 个词全部 0 候选，接尾阶段把正文搅成字符交织的乱码。
+    //    根因经真机探针定位为**两条**：
+    //      a) 抖音的联想面板**永远把你输入的词回显成一个候选（浏览量 0）** ——
+    //         抖音话题库里没有这个词时，面板照样显示「#ZZZ不存在话题 0」。
+    //         只按「精确名匹配」判 → 把 count=0 的假候选当真 → 点下去不落 chip，
+    //         而且假候选留在编辑器里会成为后续前缀替换的引子。
+    //         → 判据必须是 **精确名命中 且 浏览量 > 0**。
+    //      b) 用 selectAllChildren+collapseToEnd 挪光标会**破坏编辑器 selection 状态**
+    //         （抖音编辑器是 Ace 系：ace-line / data-leaf / data-string）——
+    //         面板不弹、文本插错位置 → 表现为「0 候选 + 字符交织」。
+    //         → 光标定位改用 **Control+End**（End 只到当前折行行尾，多行正文会插进中间）。
+    //    现在的做法：逐词处理 → 有真实候选就点选落地 chip → 没有就**立刻精确回删**
+    //    （Escape 关面板后纯文本可干净回删）→ 每步都校验 chip 数与正文长度，
+    //    对不上就中止并告警，绝不交割乱稿。
+    const TOPIC_MAX = 5;
+    const readState = () => page.evaluate(() => {
+      const ed = document.querySelector('.ql-editor, [contenteditable="true"]');
+      const text = ed ? (ed.innerText || ed.textContent || '') : '';
+      return {
+        len: text.length,
+        chips: document.querySelectorAll('[data-mention]').length,
+        tail: text.slice(-300),
+      };
+    });
+    const readCands = () => page.evaluate(() => {
+      const out = [];
+      const seen = new Set();
+      for (const nm of document.querySelectorAll('[class*="tag-hash-view-name"]')) {
+        const name = (nm.textContent || '').trim();
+        if (!name) continue;
+        let row = nm.parentElement;
+        let guard = 0;
+        while (row && !row.querySelector('[class*="tag-hash-view-count"]') && guard++ < 6) row = row.parentElement;
+        if (!row || seen.has(row)) continue;
+        const r = row.getBoundingClientRect();
+        if (!r.width || !r.height) continue;
+        seen.add(row);
+        const ct = row.querySelector('[class*="tag-hash-view-count"]');
+        out.push({ name, countText: ct ? (ct.textContent || '').trim() : '0', x: r.x + r.width / 2, y: r.y + r.height / 2 });
+      }
+      return out;
+    });
+    const parseCount = (text) => {
+      if (!text) return 0;
+      const m = String(text).match(/([\d.]+)\s*([万亿]?)/);
+      if (!m) return 0;
+      const n = parseFloat(m[1]) || 0;
+      if (m[2] === '万') return n * 1e4;
+      if (m[2] === '亿') return n * 1e8;
+      return n;
+    };
+    // 只认浏览量 > 0 的候选（count=0 是面板的回显假候选）
+    const pickCand = (items, kw) => {
+      const viable = items.filter((x) => parseCount(x.countText) > 0);
+      if (!viable.length) return null;
+      const exact = viable.find((x) => x.name === kw);
+      if (exact) return exact;
+      const ci = viable.filter((x) => x.name.toLowerCase() === kw.toLowerCase());
+      if (!ci.length) return null;
+      return ci.sort((a, b) => parseCount(b.countText) - parseCount(a.countText))[0];
+    };
+    // ⚠️ 2026-10-22 实测踩坑：抖音面板是**两段式 + 异步过滤**渲染 ——
+    //   ① 立刻渲染一个「回显候选」（就是你刚输入的词，浏览量恒为 0）
+    //   ② 远程候选列表稍后才回来（真候选浏览量 > 0）
+    //   ③ 边打字边过滤：一次性打完整个词后，面板可能还在用**上一次的查询词**返回结果
+    //   「面板出现了」不等于「候选列表到了且是当前的」→ 只等面板出现就读，
+    //   每次都只读到 count=0 的回显 → 所有词误判成「话题库里没有」→ 一个 chip 都落不上。
+    //   → 判据：**连续两轮读到相同的候选列表**（列表已稳定）才判定；超时取最后一次。
+    const waitPanel = async () => {
+      const deadline = Date.now() + 8000;
+      let last = [];
+      let lastKey = '';
+      let stable = 0;
+      while (Date.now() < deadline) {
+        const items = await readCands();
+        const key = items.map((x) => x.name + ':' + x.countText).join('|');
+        if (key && key === lastKey) stable++; else stable = 0;
+        lastKey = key;
+        last = items;
+        if (items.length && stable >= 2) return items;
+        await page.waitForTimeout(300);
+      }
+      return last;
+    };
+    const pinToEnd = async () => {
+      // ⚠️ 不用 selectAllChildren（会破坏 selection 状态）—— 用 Control+End
+      await page.keyboard.press('Control+End');
+      await page.waitForTimeout(150);
+    };
+
+    let topicState = await readState();
+    const baseLen = topicState.len;
+    const baseChips = topicState.chips;
     let linked = 0;
-    const droppedTags = [];
+    const skippedTags = [];   // 抖音话题库里确实没有这个词
+    const overLimitTags = []; // 填满上限才没轮到（与上面是两回事，日志要分开报）
+    let topicGarbled = false;
+
     for (const kw of topicTags) {
-      // 2026-09-28：点选联想后焦点可能落在话题 chip 上，后续 End/输入会落空——每轮前重钉光标到文末
-      await page.evaluate(() => {
-        const ed = document.querySelector('.ql-editor, [contenteditable="true"]');
-        if (ed && ed.focus) { ed.focus(); const sel = window.getSelection(); if (sel && sel.selectAllChildren) { sel.selectAllChildren(ed); sel.collapseToEnd(); } }
-      });
+      if (linked >= TOPIC_MAX) { overLimitTags.push(...topicTags.slice(topicTags.indexOf(kw))); break; }
+      await pinToEnd();
       await page.waitForTimeout(200);
-      await page.keyboard.type(' #' + kw, { delay: 100 });
-      let hit = null;
-      for (let i = 0; i < 6 && !hit; i++) {
-        await page.waitForTimeout(1000);
-        const items = await page.evaluate(() => [...document.querySelectorAll('[class*="tag-hash-o0tpyE"]')].map((el) => {
-          const nm = el.querySelector('[class*="tag-hash-view-name"]');
-          const ct = el.querySelector('[class*="tag-hash-view-count"]');
-          const r = el.getBoundingClientRect();
-          return { name: nm ? nm.textContent.trim() : '', count: ct ? ct.textContent.trim() : '0', x: r.x + r.width / 2, y: r.y + r.height / 2 };
-        }));
-        hit = items.find((x) => x.name === kw) || null;
-        if (!hit) {
-          const ci = items.filter((x) => x.name.toLowerCase() === kw.toLowerCase());
-          if (ci.length) hit = ci.sort((a, b) => (parseFloat(b.count) || 0) - (parseFloat(a.count) || 0))[0];
+      const needSpace = !/[ \u00a0]$/.test(topicState.tail);
+      const typed = (needSpace ? ' ' : '') + '#' + kw;
+      const before = await readState();
+      await page.keyboard.type(typed, { delay: 80 });
+      await page.waitForTimeout(400);
+      const items = await waitPanel();
+      const hit = pickCand(items, kw);
+      console.log(
+        '话题「' + kw + '」面板返回 ' + items.length + ' 个候选: ' +
+          (items.length ? items.slice(0, 6).map((x) => x.name + '(' + x.countText + ')').join(' / ') : '无') +
+          (hit ? ' → 命中「' + hit.name + '」' : ' → 无精确匹配')
+      );
+      if (!hit) {
+        // 抖音话题库里没有这个词 → 立刻精确回删（不留残字、不留开着的面板）
+        await page.keyboard.press('Escape');
+        await page.waitForTimeout(300);
+        for (let i = 0; i < typed.length; i++) await page.keyboard.press('Backspace');
+        await page.waitForTimeout(250);
+        const after = await readState();
+        if (after.len !== before.len || after.chips !== before.chips) {
+          console.log('✗ 回删「' + kw + '」后正文对不上（长度 ' + before.len + '→' + after.len + '，chip ' + before.chips + '→' + after.chips + '）—— 停止填话题');
+          topicGarbled = true;
+          topicState = after;
+          break;
         }
+        skippedTags.push(kw);
+        console.log('话题「' + kw + '」抖音话题库里没有（浏览量 0）→ 已回删跳过');
+        topicState = after;
+        continue;
       }
-      if (hit) {
-        await page.mouse.click(hit.x, hit.y);
-        await page.waitForTimeout(1200);
-        linked++;
-      } else {
-        // 联想无匹配：保留纯文本（禁 Backspace 回删——会破坏已落地话题），继续下一个
-        await page.keyboard.press('End');
-        droppedTags.push(kw);
+      await page.mouse.click(hit.x, hit.y);
+      await page.waitForTimeout(1000);
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(250);
+      const after = await readState();
+      if (after.chips !== before.chips + 1) {
+        console.log('⚠ 点选「' + hit.name + '」没落成 chip（chip ' + before.chips + '→' + after.chips + '）→ 回删重试判定');
+        await pinToEnd();
+        for (let i = 0; i < typed.length + 2; i++) await page.keyboard.press('Backspace');
+        await page.waitForTimeout(250);
+        const fixed = await readState();
+        if (fixed.chips !== before.chips) {
+          console.log('✗ 点选失败后回删把已落地 chip 也啃掉了（chip ' + before.chips + '→' + fixed.chips + '）—— 停止填话题');
+          topicGarbled = true;
+          topicState = fixed;
+          break;
+        }
+        skippedTags.push(kw);
+        topicState = fixed;
+        continue;
       }
+      linked++;
+      console.log('话题「' + kw + '」已点选落地（候选「' + hit.name + '」' + hit.countText + '）');
+      await pinToEnd();
+      topicState = after;
     }
-    console.log('话题已选 ' + linked + ' 个' + (droppedTags.length ? '（无联想匹配，保留纯文本: ' + droppedTags.join('/') + '）' : ''));
+
+    // 收尾：读回 + 碎片检测（一个 token 里出现第二个 # 就是碎片）
+    topicState = await readState();
+    const bad = topicState.tail.split(/\s+/).filter((t) => t.includes('#') && (t.match(/#/g) || []).length > 1);
+    if (bad.length) {
+      console.log('⚠ 描述尾部检测到疑似碎片：' + bad.slice(0, 3).join(' / ') + ' —— 请人工核对截图再发布');
+      topicGarbled = true;
+    }
+    if (topicState.chips - baseChips !== linked) {
+      console.log('⚠ 话题 chip 数与记录不一致（记录 ' + linked + '，DOM ' + (topicState.chips - baseChips) + '）—— 请人工核对');
+      topicGarbled = true;
+    }
+    if (skippedTags.length) {
+      console.log('话题跳过 ' + skippedTags.length + ' 个（抖音话题库无此话题）: ' + skippedTags.join('/'));
+    }
+    if (overLimitTags.length) {
+      console.log('话题另有 ' + overLimitTags.length + ' 个未填（已达抖音上限 ' + TOPIC_MAX + ' 个，非「话题库没有」）: ' + overLimitTags.join('/'));
+    }
+    console.log('话题已落地 ' + linked + ' 个 chip（正文 ' + baseLen + ' → ' + topicState.len + ' 字）');
     await page.keyboard.press('Escape');
     await page.keyboard.press('Escape');
     console.log('描述已填写');
