@@ -18,6 +18,9 @@
 //       设置视频双封面（点槽位 →「上传封面」filechooser → 完成）。
 //   node platforms/douyin.cjs collect [--kind image|video] [--album "<合集名>"]
 //       选合集 + 自主声明「内容由AI生成」（2026-09-23 起经实测确定图文与视频都填）。
+//   node platforms/douyin.cjs music [--kind image] [--music "<曲名>"]
+//       选配乐（2026-10-22 起自动化，之前一直是人工选「收藏配乐 Opus 37」）。
+//       走「收藏」tab → 按曲名精确匹配 → 点卡片上的「使用」。**仅图文线有配乐入口**。
 //   node platforms/douyin.cjs shot [--kind image|video]
 //       截图存档（publish.screenshot_dir 下 douyin-image.png / douyin-video.png）。
 //
@@ -89,6 +92,217 @@ function parseArgs(argv) {
 // 两处都没有 → 留空（跳过该字段 + 告警），绝不猜一个值填上去。
 function resolveAlbum(args) {
   return ('album' in args ? args.album : cfg.hint('douyin', 'album')) || '';
+}
+
+// ── 抖音图文「配乐」选择（2026-10-22）────────────────────────────────────
+// 地面真相与坑位说明见下方 `music` 子命令的注释块。
+// 返回 true = 已确认生效；false = 没生效（调用方只告警，不打断整条发布线）。
+
+/** 扩展信息区配乐行读数（「修改音乐」只在已应用时出现） */
+function readMusicRow(page) {
+  return page
+    .evaluate(() => {
+      let best = null;
+      for (const el of document.querySelectorAll('div,span')) {
+        const t = el.innerText || '';
+        if (!t) continue;
+        if (!t.includes('修改音乐') && !t.includes('选择音乐')) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 200 || r.height > 200) continue;
+        if (!best || t.length < best.text.length) best = { text: t };
+      }
+      return {
+        text: best ? best.text : '',
+        applied: (document.body.innerText || '').includes('修改音乐'),
+      };
+    })
+    .catch(() => ({ text: '', applied: false }));
+}
+
+/** 关掉音乐抽屉（失败路径也必须调 —— 开着会挡住合集下拉） */
+async function closeMusicPanel(page) {
+  const isOpen = () =>
+    page
+      .evaluate(() => {
+        const el = document.querySelector('[class*="music-side-sheet"]');
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 50 && r.height > 50;
+      })
+      .catch(() => false);
+  if (!(await isOpen())) return;
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(700);
+  if (!(await isOpen())) return;
+  const mask = await page
+    .evaluate(() => {
+      const sheet = document.querySelector('[class*="music-side-sheet"]');
+      if (!sheet) return null;
+      const r = sheet.getBoundingClientRect();
+      return { x: Math.max(20, Math.round(r.x / 2)), y: Math.round(window.innerHeight / 2) };
+    })
+    .catch(() => null);
+  if (mask) {
+    await page.mouse.click(mask.x, mask.y);
+    await page.waitForTimeout(900);
+  }
+}
+
+/**
+ * 找曲名（精确匹配）+ **同行「使用」按钮**。
+ * ⚠️ 2026-10-22 实测教训：曾另写一份 findUseButton（逻辑看着一样）在真机上**恒返回 null**，
+ *   而这一份 findSong 同时返回「曲名坐标」和「同行按钮」，探针逐值验证有效
+ *   （hover 曲名 → 按钮从零尺寸展开成 52×32，与曲名中心 y 差 9px）。
+ *   → **只保留一个实现**，避免两份逻辑漂移。
+ */
+function findSong(page, name) {
+  return page
+    .evaluate((nm) => {
+      const sheet = document.querySelector('[class*="music-side-sheet"]');
+      if (!sheet) return null;
+      const hit = [...sheet.querySelectorAll('[class*="song-name"], [class*="song_name"]')].find(
+        (n) => (n.textContent || '').trim() === nm
+      );
+      if (!hit) return null;
+      const hr = hit.getBoundingClientRect();
+      const nameCenterY = hr.y + hr.height / 2;
+      let use = null;
+      for (const b of sheet.querySelectorAll('button')) {
+        const txt = (b.textContent || '').trim();
+        if (!/使用/.test(txt)) continue;
+        const r = b.getBoundingClientRect();
+        if (r.width < 5 || r.height < 5) continue; // 零尺寸 = 还没 hover 展开
+        if (Math.abs(r.y + r.height / 2 - nameCenterY) > 30) continue;
+        use = { x: r.x + r.width / 2, y: r.y + r.height / 2, w: Math.round(r.width), h: Math.round(r.height) };
+        break;
+      }
+      return { nameX: hr.x + hr.width / 2, nameY: nameCenterY, useButton: use };
+    }, name)
+    .catch(() => null);
+}
+
+/** 把曲名拉回视口（乱滚会把它推出视口，见坑位⑥） */
+function scrollSongIntoView(page, name) {
+  return page
+    .evaluate((nm) => {
+      const sheet = document.querySelector('[class*="music-side-sheet"]');
+      if (!sheet) return null;
+      const hit = [...sheet.querySelectorAll('[class*="song-name"], [class*="song_name"]')].find(
+        (n) => (n.textContent || '').trim() === nm
+      );
+      if (!hit) return null;
+      const vh = window.innerHeight;
+      const targetY = Math.round(vh * 0.25);
+      const cur = hit.getBoundingClientRect().top;
+      if (cur >= 0 && cur <= vh - 40) return { already: true };
+      let el = hit;
+      let guard = 0;
+      while (el && el !== sheet && guard++ < 14) {
+        if (el.scrollHeight > el.clientHeight + 10 && el.clientHeight > 100) {
+          el.scrollTop += cur - targetY;
+          return { scrolled: true };
+        }
+        el = el.parentElement;
+      }
+      return { scrolled: false };
+    }, name)
+    .catch(() => null);
+}
+
+/** 找「使用」按钮（**同行判定**：与曲名同一行、文本含「使用」——探针实测唯一跑通的判定） */
+function findUseButton(page, name) {
+  return findSong(page, name).then((s) => (s ? s.useButton : null));
+}
+
+async function selectMusic(page, name, tab = '收藏') {
+  try {
+    // ① 入口（点 action 那个，不是行标题）
+    const entry = await page.evaluate(() => {
+      const cands = [];
+      for (const el of document.querySelectorAll('span[class*="action"],button,a')) {
+        const t = (el.textContent || '').trim();
+        if (t !== '选择音乐' && t !== '添加音乐') continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 5 || r.height < 5) continue;
+        cands.push({ x: r.x + r.width / 2, y: r.y + r.height / 2, area: r.width * r.height });
+      }
+      cands.sort((a, b) => a.area - b.area);
+      return cands[0] || null;
+    });
+    if (!entry) {
+      console.warn('⚠ 未找到「选择音乐」入口 —— 配乐未设置');
+      return false;
+    }
+    await page.mouse.click(entry.x, entry.y);
+    await page.waitForTimeout(2000);
+
+    // ② 切「收藏」tab（可能在横向滚动区里 → 先 scrollIntoView）
+    const tabPos = await page.evaluate((lb) => {
+      const hit = [...document.querySelectorAll('.semi-tabs-tab, [class*="semi-tabs-tab"]')].find(
+        (t) => (t.textContent || '').trim() === lb
+      );
+      if (!hit) return null;
+      hit.scrollIntoView({ block: 'center', inline: 'center' });
+      const r = hit.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    }, tab);
+    if (!tabPos) {
+      console.warn('⚠ 音乐面板里没找到「' + tab + '」tab —— 配乐未设置');
+      return false;
+    }
+    await page.mouse.click(tabPos.x, tabPos.y);
+    await page.waitForTimeout(2500);
+
+    // ③ 找曲名
+    let song = null;
+    for (let i = 0; i < 10 && !song; i++) {
+      song = await findSong(page, name);
+      if (!song) await page.waitForTimeout(600);
+    }
+    if (!song) {
+      console.warn('⚠ 收藏里没找到配乐「' + name + '」—— 配乐未设置');
+      return false;
+    }
+
+    // ④ 拉回视口 → hover → 找「使用」按钮
+    let useBtn = null;
+    for (let attempt = 1; attempt <= 4 && !useBtn; attempt++) {
+      const sc = await scrollSongIntoView(page, name);
+      if (sc && sc.scrolled) await page.waitForTimeout(700);
+      const s = await findSong(page, name);
+      if (s && s.nameX) {
+        // ⚠️ **只 hover 曲名本身**（探针实测：hover 曲名 → 「使用」按钮从零尺寸展开成 52×32）。
+        //    ⛔ 不要把鼠标移到别处 —— 移开就失去 hover，按钮又缩回零尺寸。
+        await page.mouse.move(s.nameX, s.nameY);
+        await page.waitForTimeout(900);
+      }
+      useBtn = await findUseButton(page, name);
+      if (!useBtn) continue;
+    }
+    if (!useBtn) {
+      console.warn('⚠ 找不到配乐「' + name + '」的「使用」按钮 —— 配乐未设置');
+      return false;
+    }
+
+    // ⑤ 点「使用」（点后抽屉自动关闭、配乐立即生效）
+    await page.mouse.click(useBtn.x, useBtn.y);
+    await page.waitForTimeout(2500);
+
+    // ⑥ 校验读数
+    for (let i = 0; i < 8; i++) {
+      const st = await readMusicRow(page);
+      if (st.applied && st.text.includes(name)) {
+        console.log('配乐已选: ' + name + ' ✓（扩展信息区读数确认）');
+        return true;
+      }
+      await page.waitForTimeout(600);
+    }
+    console.warn('⚠ 点了「使用」但扩展信息区读数没变成「' + name + '」—— 请人工核对');
+    return false;
+  } finally {
+    // 无论成功失败都要关抽屉
+    await closeMusicPanel(page);
+  }
 }
 
 // 判别一个标签页属于哪个 kind：URL 精确特征优先，其次读 open 时写入的 dyKind 标。
@@ -421,6 +635,36 @@ async function kindOf(page) {
     await page.keyboard.press('Escape');
     await page.keyboard.press('Escape');
     console.log('描述已填写');
+  }
+
+  if (cmd === 'music') {
+    // 抖音图文「配乐」：收藏 → 指定曲目 → 点「使用」
+    // 2026-10-22 起自动化（之前一直是人工选「收藏配乐 Opus 37」）。
+    //
+    // ── 地面真相（ego lite 真机探针实测，与 content 工作区 ego 通道同源）──
+    //   ① 入口 = 扩展信息区「选择音乐」。⚠️ 页面上这文案出现**两次**：
+    //      行标题（span.title-content-*）与右侧**动作按钮**（span.action-*）——
+    //      点标题不生效，必须点 action 那个。
+    //   ② 面板 = **右侧抽屉**（[class*="music-side-sheet"]），不是 modal。
+    //   ③ 「收藏」tab = .semi-tabs-tab 文案**恰为**「收藏」；
+    //      在 .semi-overflow-list 里（宽 332px）可能被横向滚动藏起来 → 先 scrollIntoView。
+    //   ④ 曲目卡：曲名在 [class*="song-name"]（精确文本）；
+    //      「使用」按钮 class 含 apply-btn-*，与曲名**同卡片并排**（不在曲名的祖先链上）
+    //      → 从**按钮往上**回溯卡片曲名。
+    //   ⑤ ⚠️ 「使用」按钮**零尺寸**（未 hover 时 rect=0×0）→ 不能按尺寸过滤；
+    //      零尺寸时用**卡片右缘**反推位置。
+    //   ⑥ ⚠️ 乱滚会把曲名推出视口（实测曲名 y=-127）→ 滚动要把曲名**拉回视口**。
+    //   ⑦ ✅ 点「使用」后抽屉自动关闭、配乐立即生效；底部「确定」是 disabled，**不要点**。
+    //   ⚠️ 失败时**必须关抽屉** —— 开着会挡住后面的合集下拉。
+    const musicName = ('music' in args ? args.music : cfg.hint('douyin', 'music')) || '';
+    if (!musicName) {
+      cfg.warnSkipped('douyin', 'music', '抖音配乐');
+    } else {
+      const musicOk = await selectMusic(page, musicName);
+      if (!musicOk) {
+        console.warn('⚠ 配乐未自动设置 —— 请人工在发布页选「' + musicName + '」');
+      }
+    }
   }
 
   if (cmd === 'collect') {

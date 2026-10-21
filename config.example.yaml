@@ -67,6 +67,9 @@ platforms:
     album: ""
     # 自主声明「内容由AI生成」
     self_declare: true
+    # 图文线配乐：值 = 收藏配乐里的曲名（如 "Opus 37"）。留空 = 不碰配乐 + 告警，**绝不猜**。
+    #   只有图文线有配乐入口（视频线是视频自带音轨）。
+    music: ""
 
   shipinhao:
     enabled: false
