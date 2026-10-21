@@ -177,14 +177,22 @@ function matchStripToSources(items, srcDims) {
   const activated = await p.evaluate(() => {
     const ed = document.querySelector('.public-DraftEditor-content');
     if (ed && ed.getBoundingClientRect().width > 0) return { alreadyOpen: true };
-    for (const el of document.querySelectorAll('div,span,button,a')) {
-      const t = (el.textContent || '').trim();
-      if (t === '分享此刻的想法...' || t === '分享此刻的想法…' || (t.length > 4 && t.length < 20 && /分享此刻的想法/.test(t))) {
+    const cands = Array.from(document.querySelectorAll('div,span,button,a'));
+    // 2026-10-21 修：优先精确文本命中占位符本体。
+    // 原逻辑按 DOM 顺序取第一个匹配，会先命中「分享此刻的想法...同步到圈子发想法」这个**容器**，
+    // 其几何中心落在两段文字之间的空隙 → 点了没反应 → 编辑器 0 宽报错。
+    // 改为两轮：① 精确文本（占位符本体）；② 才退回宽松正则（兼容改版后的其他文案）。
+    const pick = (pred) => {
+      for (const el of cands) {
+        const t = (el.textContent || '').trim();
+        if (!pred(t)) continue;
         const r = el.getBoundingClientRect();
         if (r.width > 20 && r.height > 5) return { x: r.x + r.width / 2, y: r.y + r.height / 2, tag: el.tagName, t };
       }
-    }
-    return null;
+      return null;
+    };
+    return pick(t => t === '分享此刻的想法...' || t === '分享此刻的想法…')
+      || pick(t => t.length > 4 && t.length < 20 && /分享此刻的想法/.test(t));
   });
   if (activated && activated.alreadyOpen) console.log('想法编辑器已处于编辑态');
   else if (activated) {
@@ -239,152 +247,184 @@ function matchStripToSources(items, srcDims) {
     //    L1 图片工具栏按钮（icon BUTTON，无文本）→ L2 Popover「上传图片」→ L3 Modal 内
     //    「本地图片上传」→ 才触发 filechooser。
     //    隐藏 input 直接 setInputFiles **完全无效**（编辑器内 0 图，走满 60s 也不落地）。
-    const picBtn = await p.evaluate(() => {
-      const ed = document.querySelector('.public-DraftEditor-content');
-      if (!ed) return null;
-      const edBox = ed.getBoundingClientRect();
-      const cands = [...document.querySelectorAll('button')].map((el) => ({ el, r: el.getBoundingClientRect() }))
-        .filter(({ r }) => r.width >= 15 && r.width <= 30 && r.height >= 15 && r.height <= 30
-          && r.x > edBox.x - 60 && r.x < edBox.x + edBox.width
-          && r.y > edBox.y - 5 && r.y < edBox.y + 180);
-      if (!cands.length) return null;
-      cands.sort((a, b) => a.r.x - b.r.x);
-      // 工具栏顺序 # / 表情 / 图片 / 视频 / 图表 —— 图片是第 3 个
-      const r = cands[Math.min(2, cands.length - 1)].r;
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2, n: cands.length };
-    });
-    if (!picBtn) throw new Error('未找到图片工具栏按钮（icon 定位失败，页面改版？）');
-    console.log('L1 图片工具栏按钮:', JSON.stringify(picBtn));
-    await p.mouse.click(picBtn.x, picBtn.y);
-    await sleep(2500);
+    // ── 逐张插入（2026-10-21 重构）────────────────────────────────────────
+    //  原实现：8 张一次上传 → 在 Modal 网格里逐张点选 → 一次「插入图片」。
+    //  实测问题：Modal 网格每行最后一张会被滚动裁切，点选落在裁切区外 → 该图没被选中
+    //  → 插入数随机少 1~2 张（实测 7/8、6/8，两次跑结果不同），脚本判据报错但图确实没进去。
+    //  现实现：**一张一张插**（每张独立走一遍三层 UI → filechooser → 点选 → 插入），
+    //  每张都验「图集区计数必须 +1」，不达标就重试该张（上限 3 次）。
+    //  单张插入没有网格滚动问题，且每张都有独立判据，失败可定位可重试。
+    //
+    //  L1 图片工具栏按钮（icon BUTTON，无文本）：每张插入前重新定位——
+    //  图集区随插入变高，编辑器整体下移，按钮坐标会变。
+    const findPicBtn = async () => {
+      // 2026-10-21 修定位锚点：插图后**图集区变高**，工具栏图标整体下移，
+      // 旧窗口（编辑器 top+180px）会把工具栏排除在外 → 找不到按钮。
+      // 新锚点：编辑器页脚行里的「同步到圈子」——工具栏图标与它同一行，位置稳定。
+      // 先把编辑器滚进视口，保证坐标落在可视区。
+      await p.evaluate(() => {
+        const ed = document.querySelector('.public-DraftEditor-content');
+        if (ed) ed.scrollIntoView({ block: 'center' });
+      });
+      await sleep(700);
+      return p.evaluate(() => {
+        const small = [...document.querySelectorAll('button')].map((el) => ({ el, r: el.getBoundingClientRect() }))
+          .filter(({ r }) => r.width >= 15 && r.width <= 30 && r.height >= 15 && r.height <= 30);
+        let pool = small, anchor = null;
+        const sync = [...document.querySelectorAll('div,span,button,a')].find(e => {
+          const t = (e.textContent || '').trim();
+          if (!/^同步到圈子/.test(t)) return false;
+          const r = e.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        });
+        if (sync) {
+          const sr = sync.getBoundingClientRect();
+          const row = small.filter(({ r }) => Math.abs((r.y + r.height / 2) - (sr.y + sr.height / 2)) < 30 && r.x < sr.x);
+          if (row.length) { pool = row; anchor = '同步到圈子'; }
+        }
+        if (!pool.length) {
+          // 回退：编辑器同列 + 更宽的纵向窗口
+          const ed = document.querySelector('.public-DraftEditor-content');
+          if (!ed) return null;
+          const eb = ed.getBoundingClientRect();
+          pool = small.filter(({ r }) => r.x > eb.x - 60 && r.x < eb.x + eb.width && r.y > eb.y - 5 && r.y < eb.y + 700);
+          anchor = '编辑器列';
+        }
+        if (!pool.length) return null;
+        pool.sort((a, b) => a.r.x - b.r.x);
+        // 工具栏顺序 # / 表情 / 图片 / 视频 / 图表 —— 图片是第 3 个
+        const r = pool[Math.min(2, pool.length - 1)].r;
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2, n: pool.length, anchor };
+      });
+    };
 
-    // L2: Popover「上传图片」
-    const upPos = await p.evaluate(() => {
-      const el = [...document.querySelectorAll('button,div[role=button],a,span,li')]
-        .find((x) => (x.textContent || '').trim() === '上传图片' && x.getBoundingClientRect().width > 10);
-      if (!el) return null;
-      const r = el.getBoundingClientRect();
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-    });
-    if (!upPos) throw new Error('L1 已点开但未找到 Popover「上传图片」（页面改版？）');
-    console.log('L2 Popover「上传图片」:', JSON.stringify(upPos));
-    await p.mouse.click(upPos.x, upPos.y);
-    await sleep(3000);
 
-    // L3: Modal 内「本地图片上传」→ filechooser
-    const localPos = await p.evaluate(() => {
-      const el = [...document.querySelectorAll('button,div[role=button],a,span,li,div')]
-        .find((x) => (x.textContent || '').trim() === '本地图片上传' && x.getBoundingClientRect().width > 10);
-      if (!el) return null;
-      const r = el.getBoundingClientRect();
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-    });
-    if (!localPos) throw new Error('L2 已点开但未找到 Modal「本地图片上传」（页面改版？）');
-    console.log('L3「本地图片上传」:', JSON.stringify(localPos));
-    const [chooser] = await Promise.all([
-      p.waitForEvent('filechooser', { timeout: 10000 }),
-      p.mouse.click(localPos.x, localPos.y),
-    ]);
-    await chooser.setFiles(imgs);
-    console.log(`已通过 filechooser 提交 ${count} 张图（multiple=${chooser.isMultiple()}），等待上传落编辑器…`);
+    // 插入单张：L1 工具栏 → L2 Popover「上传图片」→ L3 Modal「本地图片上传」→ filechooser
+    //          → 等预览 → 点选预览 → 点「插入图片」
+    const insertOne = async (file) => {
+      const picBtn = await findPicBtn();
+      if (!picBtn) throw new Error('未找到图片工具栏按钮（icon 定位失败，页面改版？）');
+      await p.mouse.click(picBtn.x, picBtn.y);
+      await sleep(2000);
 
-    // 2) 等图片上传进 Modal（正面证据 = Modal 内 blob 预览 ≥count）
-    //    然后必须**逐张点选预览图**再点「插入图片」——经实测确定：
-    //    不点选直接点「插入图片」会插入平台默认的活动推广图（一张平台自带的运营图），
-    //    用户自己的 6 张图被静默丢弃，编辑器里只剩那张活动图。
-    let modalOk = false;
-    for (let i = 0; i < 20; i++) {
-      await sleep(3000);
-      const st = await p.evaluate(() => {
-        const modal = document.querySelector('.Modal');
-        if (!modal) return { modal: false, blobs: 0 };
-        // blob: 预览图（每张渲染两层，阈值取一半）
-        const blobs = [...modal.querySelectorAll('img')].filter((x) => (x.currentSrc || x.src || '').startsWith('blob:')).length;
-        const hasInsert = [...modal.querySelectorAll('button')].some((b) => (b.textContent || '').trim() === '插入图片' && b.getBoundingClientRect().width > 0);
-        return { modal: true, blobs, hasInsert };
-      }).catch(() => null);
-      if (!st) continue;
-      console.log(`  t+${(i + 1) * 3}s Modal 预览 blob=${st.blobs} 插入按钮=${st.hasInsert}`);
-      if (st.blobs >= count && st.hasInsert) { modalOk = true; break; }
-    }
-    if (!modalOk) throw new Error(`图片未在 60s 内上传进 Modal 或「插入图片」按钮未出现`);
-    console.log('图片已上传进 Modal ✓');
+      const upPos = await p.evaluate(() => {
+        const el = [...document.querySelectorAll('button,div[role=button],a,span,li')]
+          .find((x) => (x.textContent || '').trim() === '上传图片' && x.getBoundingClientRect().width > 10);
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      });
+      if (!upPos) throw new Error('L1 已点开但未找到 Popover「上传图片」（页面改版？）');
+      await p.mouse.click(upPos.x, upPos.y);
+      await sleep(2500);
 
-    // 逐张点选预览图（按 blob src 去重；每张先滚进视口再点，8 张时网格会滚动）
-    const blobSrcs = await p.evaluate(() => {
-      const modal = document.querySelector('.Modal');
-      if (!modal) return [];
-      const seen = new Set(); const out = [];
-      for (const im of modal.querySelectorAll('img')) {
-        const src = im.currentSrc || im.src || '';
-        if (!src.startsWith('blob:')) continue;
-        if (seen.has(src)) continue;
-        seen.add(src);
-        out.push(src);
+      const localPos = await p.evaluate(() => {
+        const el = [...document.querySelectorAll('button,div[role=button],a,span,li,div')]
+          .find((x) => (x.textContent || '').trim() === '本地图片上传' && x.getBoundingClientRect().width > 10);
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      });
+      if (!localPos) throw new Error('L2 已点开但未找到 Modal「本地图片上传」（页面改版？）');
+      const [chooser] = await Promise.all([
+        p.waitForEvent('filechooser', { timeout: 10000 }),
+        p.mouse.click(localPos.x, localPos.y),
+      ]);
+      await chooser.setFiles([file]);
+
+      // 等预览 blob 出现（Modal 上限 18 张；这里只上传 1 张）
+      let ready = false, blobN = 0;
+      for (let i = 0; i < 15; i++) {
+        await sleep(1500);
+        const st = await p.evaluate(() => {
+          const modal = document.querySelector('.Modal');
+          if (!modal) return { blobs: 0, hasInsert: false };
+          const seen = new Set();
+          for (const im of modal.querySelectorAll('img')) {
+            const src = im.currentSrc || im.src || '';
+            if (src.startsWith('blob:')) seen.add(src);
+          }
+          const hasInsert = [...modal.querySelectorAll('button')].some((b) => (b.textContent || '').trim() === '插入图片' && b.getBoundingClientRect().width > 0);
+          return { blobs: seen.size, hasInsert };
+        }).catch(() => null);
+        if (!st) continue;
+        blobN = st.blobs;
+        if (st.blobs >= 1 && st.hasInsert) { ready = true; break; }
       }
-      return out;
-    });
-    const pickN = Math.min(blobSrcs.length, count);
-    console.log(`待点选预览 ${pickN} 张（Modal 内 blob 预览共 ${blobSrcs.length} 张）`);
-    for (let i = 0; i < pickN; i++) {
-      const ok = await p.evaluate((src) => {
-        const modal = document.querySelector('.Modal');
-        if (!modal) return false;
-        const im = [...modal.querySelectorAll('img')].find((x) => (x.currentSrc || x.src || '') === src);
-        if (!im) return false;
-        im.scrollIntoView({ block: 'center' });
-        return true;
-      }, blobSrcs[i]).catch(() => false);
-      if (!ok) continue;
-      await sleep(200);
-      const pt = await p.evaluate((src) => {
+      if (!ready) throw new Error('单张图片未在 30s 内进入 Modal 预览');
+
+      // 点选预览：取**最后一个**唯一 blob（Modal 若保留了上轮文件，新传的在末尾）
+      const pt = await p.evaluate(() => {
         const modal = document.querySelector('.Modal');
         if (!modal) return null;
-        const im = [...modal.querySelectorAll('img')].find((x) => (x.currentSrc || x.src || '') === src);
-        if (!im) return null;
-        const r = im.getBoundingClientRect();
+        const seen = new Set();
+        let last = null;
+        for (const im of modal.querySelectorAll('img')) {
+          const src = im.currentSrc || im.src || '';
+          if (!src.startsWith('blob:') || seen.has(src)) continue;
+          seen.add(src);
+          last = im;
+        }
+        if (!last) return null;
+        last.scrollIntoView({ block: 'center' });
+        const r = last.getBoundingClientRect();
         if (r.width < 10) return null;
-        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-      }, blobSrcs[i]).catch(() => null);
-      if (!pt) continue;
+        // 取「预览 ∩ 滚动容器可见区」的交集中心，避免点到被裁切掉的区域
+        let cont = last.parentElement, cr = null;
+        while (cont && cont !== document.body) {
+          const s = getComputedStyle(cont);
+          if (/auto|scroll/.test(s.overflowY + s.overflowX)) { cr = cont.getBoundingClientRect(); break; }
+          cont = cont.parentElement;
+        }
+        const vr = { top: 0, bottom: window.innerHeight, left: 0, right: window.innerWidth };
+        const box = cr || vr;
+        const top = Math.max(box.top, r.top, vr.top), bottom = Math.min(box.bottom, r.bottom, vr.bottom);
+        const left = Math.max(box.left, r.left, vr.left), right = Math.min(box.right, r.right, vr.right);
+        if (bottom - top < 8 || right - left < 8) return { x: r.x + r.width / 2, y: r.y + r.height / 2, clipped: true };
+        return { x: (left + right) / 2, y: (top + bottom) / 2, clipped: false };
+      }).catch(() => null);
+      if (!pt) throw new Error('Modal 内未找到可点选的预览图');
       await p.mouse.click(pt.x, pt.y);
-      await sleep(350);
-    }
-    await sleep(1200);
-    console.log('预览图已逐张点选');
+      await sleep(800);
 
-    // 点「插入图片」→ 图落进**图集区**（不是编辑器容器，见坑位⑦）
-    const insPos = await p.evaluate(() => {
-      const el = [...document.querySelectorAll('.Modal button, .Modal-inner button')]
-        .find((b) => (b.textContent || '').trim() === '插入图片' && b.getBoundingClientRect().width > 0);
-      if (!el) return null;
-      const r = el.getBoundingClientRect();
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-    });
-    if (!insPos) throw new Error('未找到「插入图片」按钮');
-    console.log('点「插入图片」:', JSON.stringify(insPos));
-    await p.mouse.click(insPos.x, insPos.y);
-    await sleep(3000);
+      const insPos = await p.evaluate(() => {
+        const el = [...document.querySelectorAll('.Modal button, .Modal-inner button')]
+          .find((b) => (b.textContent || '').trim() === '插入图片' && b.getBoundingClientRect().width > 0);
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      });
+      if (!insPos) throw new Error('未找到「插入图片」按钮');
+      await p.mouse.click(insPos.x, insPos.y);
+      await sleep(2500);
+      return { blobN };
+    };
 
-    // 3) 等图片真正落进**图集区**
-    //    坑位⑦：图不在 Draft.js 编辑器容器里，在编辑器上方的 div.DraggableTags。
-    //    旧判据数编辑器容器 → 恒 0 → 误判「没传上去」（10-19 期据此误降级成人工补图）。
-    //    坑位⑧：还要逐张对上源图宽高，防止「平台默认活动图顶替了我的图」。
-    let imgOk = false, strip = { total: 0, items: [] }, m = { exact: 0, ratio: 0, matched: 0, missing: count };
-    for (let i = 0; i < 20; i++) {
-      await sleep(2000);
-      const st = await readStrip().catch(() => null);
-      if (!st) continue;
-      strip = st;
-      m = matchStripToSources(strip.items, srcDims);
-      console.log(`  t+${(i + 1) * 2}s 图集=${strip.total} 张，与源图匹配=${m.matched}/${count}（宽高全等 ${m.exact} / 仅比例一致 ${m.ratio}）`);
-      if (m.missing === 0 && m.matched >= count) { imgOk = true; break; }
+    let strip = { total: 0, items: [] }, m = { exact: 0, ratio: 0, matched: 0, missing: count };
+    for (let i = 0; i < count; i++) {
+      let ok = false, before = 0, after = 0;
+      for (let attempt = 1; attempt <= 3 && !ok; attempt++) {
+        const s0 = await readStrip().catch(() => null);
+        before = s0 ? s0.total : 0;
+        await insertOne(imgs[i]);
+        for (let t = 0; t < 10; t++) {
+          await sleep(1500);
+          const st = await readStrip().catch(() => null);
+          if (!st) continue;
+          strip = st;
+          after = st.total;
+          if (after === before + 1) { ok = true; break; }
+          if (after > before + 1) break;   // 插多了（Modal 保留了上轮文件）→ 本张作废
+        }
+        if (!ok) console.log(`  第 ${i + 1} 张插入未生效（图集区计数 ${before} → ${after}），重试`);
+      }
+      console.log(`  第 ${i + 1}/${count} 张已插入（图集区计数 ${after}）`);
+      if (!ok) throw new Error(`第 ${i + 1} 张图片插入失败（图集区计数停在 ${after}），请人工查看页面`);
     }
-    if (!imgOk) {
-      throw new Error(`图片未落图集区：检出 ${strip.total} 张，与源图匹配 ${m.matched}/${count}（缺 ${m.missing}）。`
-        + '请人工查看页面确认（下方截图已留档）。');
-    }
+    strip = await readStrip();
+    m = matchStripToSources(strip.items, srcDims);
     console.log(`图片已上稿 ✓（图集区 ${strip.total} 张，与 ${count} 张源图匹配：宽高全等 ${m.exact} / 仅比例一致 ${m.ratio}）`);
+
   } else {
     console.log('⚠ --manual-images：已跳过自动配图，图集区为空；配图需人工补齐后再点发布');
   }
