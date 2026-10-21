@@ -144,10 +144,51 @@ publish-kit 的能力演进，一直靠**真实平台上反复验证**推进。�
 - 平台知识（选择器、坑位、判据）→ 回灌本仓库，**且要带实测依据**（口径数字要标明来源）
 - content 工作区的**项目特有约定**（台账格式、workflow、素材目录）→ **不要**搬进本仓库
 - 硬闸（会阻塞的判据）必须有实测依据；没有依据的口径用**软线**（只告警）
+- ⚠️ **两边是独立仓库，代码不能共享 —— 所以平台知识会漂移。**
+  改了一边的平台逻辑，**另一边要同步**：本仓库是**开源主仓**（面向所有用户），
+  content 工作区是**重度使用方**。以本仓库为准，回灌到 content 侧。
+  同步清单见下面第五节。
 
 ---
 
-## 六、自检
+## 六、这一轮内化的同步清单
+
+publish-kit（Playwright）与 content 工作区（ego lite）是**独立仓库，代码不能共享**。
+这一轮两边都改了，**同步状态如下**：
+
+| 能力 | publish-kit | content/ego-publish | 一致？ |
+|---|---|---|---|
+| 抖音话题单轮法 | ✅ `platforms/douyin.cjs` | ✅ `lib/douyin-topics.mjs` | ✅ |
+| 抖音配乐 | ✅ `douyin.cjs music` 子命令 | ✅ `lib/douyin-music.mjs` | ✅ |
+| 抖音封面模式判据（step-active） | ✅ | ✅ | ✅ |
+| 抖音图文逐张传 + 数实际缩略图 | ✅ | ✅ | ✅ |
+| 微博九宫格计数 v4（限定 composer） | ✅ | ✅ | ✅ |
+| B站通知权限预授权 | ✅ | ✅ | ✅ |
+| 视频号可见祖先定位 | ✅ | ✅ | ✅ |
+| 条件等待 / 随机节奏 | ✅ `lib/wait.cjs` | ✅ `lib/runtime.mjs` | ⚠️ 语义一致、代码各一份 |
+| 长文本一次性插入 | ✅ `lib/wait.cjs` | ✅（抖音脚本内联） | ⚠️ |
+| 起浏览器前体检 | ✅ `lib/preflight.cjs` | ✅ `lib/preflight.mjs` | ⚠️ |
+| 并行编排 | ✅ `lib/publish-all.cjs` | ✅ `tools/publish-all.mjs` | ⚠️ |
+| 防重复台账 | ✅ `lib/ledger.cjs`（可选） | ✅ `lib/ledger.mjs`（必需） | ⚠️ 语义不同（见下） |
+
+**⚠️ 的三处说明**：
+- 条件等待 / 长文本插入：两边**语义一致但代码各一份** —— 因为运行时的 API 不同
+  （Playwright 的 `page.keyboard.insertText` vs ego lite 的 `page.keyboard.insertText`，
+  但等待/回读封装写法不同）。**行为要一致，实现可以不同**。
+- 体检：publish-kit 的 `preflight` 是**通用张数/长度检查**；content 的 `preflight.mjs`
+  还包含**台账状态**检查（那边的台账是必需的，这边是可选的）。
+- 台账：publish-kit 的台账**可选**（通用工具不该强绑）；content 的台账是**必需**
+  （内容生产线的事实源）。
+
+**同步纪律**：
+1. 平台逻辑以 **publish-kit 为准**（开源主仓），回灌到 content 侧。
+2. 回灌时**带上实测依据与日期** —— 没有依据的口径用软线。
+3. 改了一边，**在另一边记一笔**（commit message 或本文件的同步清单）。
+4. **不要指望代码共享** —— 两个独立仓库，漂移是默认状态，要靠纪律而不是机制。
+
+---
+
+## 七、自检
 
 ```bash
 node selftest.cjs      # 33 项：等待 / 日志 / 体检 / 台账 / 编排
