@@ -58,12 +58,34 @@
 //   2026-09-22 新增坑：upload-video 页会自动恢复上一次未发草稿（实测撞上早间遗留草稿
 //   导致脏表单）——填字前强制清空标题与介绍旧值；「选择标记」若已是「含 AI 生成内容」
 //   则跳过不再 FATAL；领域步失败只告警。
+//
+// ── 2026-10-22 内化（横向能力层接入）新增坑位 ────────────────────────
+//   ⑥ **点上传入口后 filechooser 偶发唤不起来**：坐标与成功那轮完全一致，文件选择器就是
+//     不弹（微博 / 抖音图文 / 抖音视频三平台都踩过）→ 整条线中止。
+//     处置：lib/wait.cjs 的 pickFileWithRetry —— 最多点 3 次，每次**重新取入口坐标**
+//     （页面重排后旧坐标会落空）；3 次全失败才退回「input 直塞」兜底。
+//   ⑦ **介绍正文逐字 type 很慢**：逐字 type 每敲一个字符都是一次 CDP 往返，
+//     实测 958 字 ≈12s，insertText 一次性插入 ≈0.6s（省约 11s）。
+//     处置：lib/wait.cjs 的 fillLongText（insertText + 回读校验 + 对不上自动退回逐块输入）。
+//     ⚠ **话题标签仍必须逐字 type**（见下面话题那圈）：只有 type 才派发按键、触发知乎
+//       联想面板，脚本才能在 .topic-name 上精确点选、落地成话题链接。
+//     ⚠ 新增**回读校验**：正文必须原样落在编辑器里；对不上 = 联想面板把词顶替了 / 被截断
+//       ——宁可炸掉，也不带脏稿交割。
+//   ⑧ **体检（preflight）必须在 connectOverCDP 之前**：起完浏览器再查等于白查
+//     （「上传后确认成功」只能证明页面上的东西，证明不了喂进去的东西）。
+//     另：日志层（lib/log.cjs）是**旁路**，只多打不改原有 console 输出。
 const fs = require('fs');
 const path = require('path');
 const cfg = require('../lib/config.cjs');
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const { chromium } = require('patchright');
 const { setVideoFile } = require('../lib/bigfile-upload.cjs');
+// 2026-10-22 内化：等待层（长文本一次性插入 / 上传入口重试）+ 日志层 + 起浏览器前体检
+const { sleep, fillLongText, pickFileWithRetry } = require('../lib/wait.cjs');
+const { create } = require('../lib/log.cjs');
+const { preflight } = require('../lib/preflight.cjs');
+
+// 每平台独立日志（旁路）。异常路径也要收尾，否则失败时反而没有留痕。
+let log = null;
 
 // 截图统一落 config.yaml 的 publish.screenshot_dir（不写死在脚本旁边）
 const shotPath = (name) => path.join(cfg.screenshotDir(), name);
@@ -92,6 +114,31 @@ function parseArgs(argv) {
   fs.mkdirSync(cfg.screenshotDir(), { recursive: true });
   const SHOT = shotPath('zhihu.png');
   const body = args['body-file'] ? fs.readFileSync(path.resolve(args['body-file']), 'utf-8').trim() : '';
+
+  // 2026-10-22：每平台独立日志（旁路，只多打不改原有 console 输出）
+  log = create({ platform: 'zhihu', kind: 'video' });
+
+  // 2026-10-22：起浏览器**之前**的体检（坑位⑧）。契约：不过就抛，别 catch 后继续。
+  if (!coverOnly) {
+    // 判据：①正文里的 undefined / NaN / [object Object]（上游生成 bug 外溢到线上内容的经典形态）
+    //        ②正文长度区间 ③标题长度
+    // ⚠ **不设 titleMax**：知乎视频标题/介绍上限口径**未确认**
+    //   （news-publisher 硬约束 #4 原文：「脚本未设防…口径未确认，别依赖」）——
+    //   猜一个上限会**误拦合法稿件**（宁可漏拦，不误拦）。要设请先实测确认再回填这里的常量。
+    // ⚠ bodySoftMax 2000 是**粗筛**不是平台口径：实测 988 字正常（2026-10-22 ego 通道），
+    //   2000 只用来提醒「明显失控」的正文，不承担平台上限的语义。
+    //   用**软线**（超了只告警）而不是硬闸 —— 上面这段注释说得很清楚：
+    //   「口径未确认，别依赖」「猜一个上限会误拦合法稿件（宁可漏拦，不误拦）」。
+    preflight({
+      platform: 'zhihu',
+      title: args.title,
+      bodyText: body,
+      limits: { bodySoftMax: 2000, bodyMin: 1 },
+    });
+    log.step('起浏览器前体检', '正文 undefined 守卫 + 长度区间');
+  } else {
+    log.step('起浏览器前体检', 'cover 补投模式，无正文，跳过');
+  }
 
   const browser = await chromium.connectOverCDP(CDP, { timeout: 15000 });
   const ctx = browser.contexts()[0];
@@ -146,6 +193,7 @@ function parseArgs(argv) {
   if (!coverOnly) {
   await setVideoFile(p, 'input[type=file][accept*="mp4"]', path.resolve(args.video));
   console.log('视频已提交，等待表单展开…');
+  log.step('上传视频', path.basename(args.video));
   for (let i = 0; i < 12; i++) {
     await sleep(10000);
     const ok = await p.evaluate(() => !!document.querySelector('textarea[placeholder="标题"]'));
@@ -161,7 +209,8 @@ function parseArgs(argv) {
     console.log('标题二次回填（命中草稿恢复竞态）');
   }
   console.log('标题已填');
-  // 4) 介绍（DraftJS 编辑器，逐字键盘输入）：正文 + 逐 tag 话题联想选中
+  log.step('标题', args.title);
+  // 4) 介绍（DraftJS 编辑器）：正文用 insertText 一次性插入（坑位⑦）+ 逐 tag 话题联想选中
   //    知乎话题必须存在于话题库：#词 输入后联想弹窗中点选 .topic-name 精确匹配项才落地为
   //    话题链接；无精确匹配的 tag 保留为纯文本（2026-09-22 起：禁止 Backspace 回删——
   //    会整体吞掉已落地的话题链接并啃正文，实测坑）；失败时点弹窗外收联想、Ctrl+End 回末尾。
@@ -176,8 +225,29 @@ function parseArgs(argv) {
   const bodyNorm = body.replace(/\r\n/g, '\n').replace(/\n{2,}/g, '\n');
   const main = bodyNorm.split('\n#')[0];
   const topicTags = (bodyNorm.match(/#[^\s#]+/g) || []).map((x) => x.slice(1));
-  await p.keyboard.type(main, { delay: 5 });
-  console.log('介绍正文已填');
+  // 2026-10-22 内化提速（坑位⑦）：正文主体改用 fillLongText ——
+  //   insertText 一次性插入 + 回读校验 + 对不上自动退回逐块输入。
+  //   ⚠ 话题标签**仍必须逐字 type**（下面那圈）：只有 type 才派发按键、触发联想面板，
+  //     脚本才能在 .topic-name 上精确点选、落地成话题链接。
+  const readEditorLen = () => p.evaluate(() => {
+    const e = document.querySelector('.public-DraftEditor-content');
+    return e ? (e.innerText || e.textContent || '').replace(/\u200b/g, '').trim().length : 0;
+  });
+  const usedFast = await fillLongText(p, readEditorLen, main, { step: 'zhihu' });
+  console.log(usedFast ? '介绍正文已填（一次性插入 + 回读校验通过）' : '介绍正文已填（退回逐块输入）');
+  log.step('介绍正文', usedFast ? 'insertText 一次性插入（回读通过）' : '退回逐块输入');
+  // 回读校验（坑位⑦的守门）：正文必须原样落在编辑器里。
+  //   对不上 = 联想面板把词顶替了 / 被截断 —— 宁可炸掉，也不带脏稿交割。
+  const edText = await p.evaluate(() => {
+    const e = document.querySelector('.public-DraftEditor-content');
+    return e ? (e.innerText || e.textContent || '').replace(/\u200b/g, '') : '';
+  });
+  const normTxt = (s) => (s || '').replace(/\s+/g, '');
+  if (normTxt(edText) && !normTxt(edText).startsWith(normTxt(main))) {
+    throw new Error('介绍正文回读不一致（可能被话题联想面板改写或截断）'
+      + '\n  期望: ' + JSON.stringify(normTxt(main).slice(0, 80))
+      + '\n  实际: ' + JSON.stringify(normTxt(edText).slice(0, 80)));
+  }
   await p.keyboard.press('Control+End');
   await sleep(300);
   let linked = 0;
@@ -214,6 +284,8 @@ function parseArgs(argv) {
     }
   }
   console.log('话题已选 ' + linked + ' 个' + (droppedTags.length ? '（无精确话题，保留纯文本: ' + droppedTags.join('/') + '）' : ''));
+  log.step('话题', linked + '/' + topicTags.length + ' 个落成链接' + (droppedTags.length ? '（未匹配: ' + droppedTags.join('/') + '）' : ''));
+  if (droppedTags.length) log.warn('有 ' + droppedTags.length + ' 个话题在联想面板里没有精确匹配，已保留纯文本: ' + droppedTags.join('/'));
   // 6) 视频标记：真实鼠标点击展开 → 选「含 AI 生成内容」→ 确认
   //    是否点选由 config.yaml 的 publish.declare_ai 决定（cfg.declareAi()，默认开）。
   //    关闭时整段跳过、不碰标记控件——平台侧是否强制要求声明由使用者自行判断，
@@ -235,6 +307,7 @@ function parseArgs(argv) {
     [...document.querySelectorAll('div,span')].some((x) => /含\s*AI\s*生成内容/.test((x.textContent || '').trim()) && x.children.length === 0 && x.offsetParent !== null));
   if (!cfg.declareAi()) {
     console.log('publish.declare_ai = false，跳过视频标记（未碰标记控件；该稿件是否需要声明由你自己确认）');
+    log.warn('publish.declare_ai = false，已跳过视频标记 —— 是否需要声明由你自己确认');
   } else if (alreadyMarked) {
     console.log('视频标记：旧草稿已选「含 AI 生成内容」，跳过');
   } else {
@@ -265,8 +338,10 @@ function parseArgs(argv) {
   });
   if (markOk) {
     console.log('视频标记：含 AI 生成内容（回读验证 ✓）');
+    log.step('视频标记', '含 AI 生成内容（回读✓）');
   } else {
     console.log('警告：视频标记回读未确认「含 AI 生成内容」已落表单（弹窗未关或懒渲染）；发布前请人工核对该项，不阻断');
+    log.warn('视频标记回读未确认「含 AI 生成内容」已落表单 —— 发布前请人工核对');
   }
   }
   } // end !coverOnly（上传与填字步整体，cover 模式直达封面步）
@@ -282,6 +357,7 @@ function parseArgs(argv) {
   const field = (args.field || '').trim() || cfg.hint('zhihu', 'field_hint');
   if (!field) {
     cfg.warnSkipped('zhihu', 'field_hint', '知乎所属领域');
+    log.warn('所属领域未配置（platforms.zhihu.field_hint 为空）——已跳过，发布前请人工选择');
   } else {
     try {
     const dd = await p.evaluate(() => {
@@ -319,6 +395,7 @@ function parseArgs(argv) {
       return !!(el && (el.textContent || '').includes(name));
     }, field);
     console.log('所属领域:' + field + (fieldOk ? '（回读验证 ✓）' : '（回读未确认，发布前请人工核对）'));
+    log.step('所属领域', field + (fieldOk ? '（回读✓）' : '（回读未确认）'));
     } catch (e) {
       console.log('警告：所属领域未设置（' + e.message + '）；该字段非必填，可人工补选，不阻断');
     }
@@ -365,22 +442,31 @@ function parseArgs(argv) {
     });
     if (tabPos) { await p.mouse.click(tabPos.x, tabPos.y); await sleep(2200); }
     else console.log('警告：未找到「本地上传」tab（可能已在 tab 上），继续尝试上传区');
-    // 8c) 定位上传区 → filechooser 竞态投图（回退：弹窗内图片 input 直塞）
-    const zone = await p.evaluate(() => {
-      const el = [...document.querySelectorAll('div')]
-        .filter((x) => x.offsetParent && /点击上传|拖入此区域/.test(x.textContent || '') && x.children.length <= 8).pop();
-      if (!el) return null;
-      const r = el.getBoundingClientRect();
-      return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
-    });
-    if (!zone) throw new Error('本地上传区未找到（「点击上传/拖入此区域」缺失）——弹窗结构改版，需人工');
+    // 8c) 定位上传区 → filechooser 投图（回退：弹窗内图片 input 直塞）
+    //     2026-10-22（坑位⑥）：点上传入口后 filechooser **偶发唤不起来**（坐标与成功那轮
+    //     完全一致，就是不弹）→ 整条线中止。处置：pickFileWithRetry 最多点 3 次，
+    //     每次**重新取入口坐标**（页面重排后旧坐标会落空）；3 次全失败才退回 input 直塞。
+    let zoneSeen = false;
+    const locateZone = async () => {
+      const z = await p.evaluate(() => {
+        const el = [...document.querySelectorAll('div')]
+          .filter((x) => x.offsetParent && /点击上传|拖入此区域/.test(x.textContent || '') && x.children.length <= 8).pop();
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+      });
+      if (z) zoneSeen = true;
+      return z;
+    };
     let fc = null;
     try {
-      [fc] = await Promise.all([
-        p.waitForEvent('filechooser', { timeout: 8000 }),
-        p.mouse.click(zone.x, zone.y),
-      ]);
-    } catch (e) { fc = null; }
+      fc = await pickFileWithRetry(p, locateZone, { attempts: 3, timeout: 8000, step: 'zhihu-cover' });
+    } catch (e) {
+      // 上传区压根不存在 = 弹窗结构改版（原来就是 FATAL，别退化成「静默直塞」）
+      if (!zoneSeen) throw new Error('本地上传区未找到（「点击上传/拖入此区域」缺失）——弹窗结构改版，需人工');
+      log.warn('封面 filechooser 3 次都没唤起（' + e.message + '）→ 退回 input 直塞');
+      fc = null;
+    }
     if (fc) {
       await fc.setFiles(coverFile);
       console.log('封面已提交（filechooser 拦截）:', path.basename(coverFile));
@@ -429,11 +515,19 @@ function parseArgs(argv) {
       throw new Error('封面未生效（无 zhimg CDN/blob 预览）——已存 ' + failShot + '。处置：重跑 node platforms/zhihu.cjs cover --cover <png>');
     }
     console.log('封面已生效 ✓（' + why + '）');
+    log.step('封面', why);
   }
 
   // 9) 截图，停「发布视频」前
   await p.screenshot({ path: SHOT });
   console.log('screenshot →', SHOT);
   console.log('STATUS: 已停在「发布视频」按钮前，等待用户点击发布');
+  log.step('已停在「发布视频」前', SHOT);
+  log.finish('ok');
   process.exit(0);
-})().catch((e) => { console.error('FATAL', e.message); process.exit(1); });
+})().catch((e) => {
+  console.error('FATAL', e.message);
+  // 异常路径也要把日志收尾（耗时表 + 告警汇总），否则失败时反而没有留痕
+  if (log) { try { log.finish('failed'); } catch (_) { /* 收尾失败不影响主流程 */ } }
+  process.exit(1);
+});

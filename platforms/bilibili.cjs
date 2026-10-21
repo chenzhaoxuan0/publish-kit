@@ -54,12 +54,34 @@
 //   任意元素文本匹配定位。以上结论均于 2026-09-16 平台实测确认。
 //   2026-09-22 加固：封面入口文案兼容「上传封面/添加封面」（当日实测改版）；封面区
 //   随视频转码延迟渲染，入口最多轮询 120s；filechooser 超时回退直塞弹窗内图片 input。
+//
+// ── 2026-10-22 内化（横向能力层接入）新增坑位 ────────────────────────
+//   ⑬ **通知权限弹窗是浏览器级的，会硬停整个脚本**：B站上传完成会弹「是否允许通知」
+//      的浏览器对话框（不是页面里的 DOM），脚本等不到页面 → 直接超时中止。
+//      处置：在**上传之前**用 Playwright 的 context.grantPermissions(['notifications'],
+//      { origin: 'https://member.bilibili.com' }) 预授权，让那个框根本不弹。
+//      ⚠ 这是**授权通知权限**的合规浏览器 API 调用，不是绕过登录、不碰 profile、不清 cookie。
+//      ⚠ 放在上传**之前**而不是「上传完成、等待表单之前」：上传期间就可能弹框。
+//   ⑭ **点上传入口后 filechooser 偶发唤不起来**：坐标与成功那轮完全一致，文件选择器
+//      就是不弹（微博 / 抖音图文 / 抖音视频三平台都踩过）→ 整条线中止。
+//      处置：lib/wait.cjs 的 pickFileWithRetry —— 最多点 3 次，每次**重新取入口坐标**；
+//      3 次全失败才退回「弹窗内图片 input 直塞」（原兜底语义保留）。
+//   ⑮ **简介逐字 type 很慢**：逐字 type 每敲一个字符都是一次 CDP 往返，
+//      实测 958 字 ≈12s，insertText 一次性插入 ≈0.6s。处置：fillLongText
+//      （insertText + 回读校验 + 对不上自动退回逐块输入）。
+//   ⑯ 体检（preflight）必须在 connectOverCDP **之前**；日志层是**旁路**，只多打不改原输出。
 const fs = require('fs');
 const path = require('path');
 const cfg = require('../lib/config.cjs');
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const { chromium } = require('patchright');
 const { setVideoFile } = require('../lib/bigfile-upload.cjs');
+// 2026-10-22 内化：等待层（长文本一次性插入 / 上传入口重试）+ 日志层 + 起浏览器前体检
+const { sleep, fillLongText, pickFileWithRetry } = require('../lib/wait.cjs');
+const { create } = require('../lib/log.cjs');
+const { preflight } = require('../lib/preflight.cjs');
+
+// 每平台独立日志（旁路）。异常路径也要收尾，否则失败时反而没有留痕。
+let log = null;
 
 // 截图统一落 config.yaml 的 publish.screenshot_dir（不写死在脚本旁边）
 const shotPath = (name) => path.join(cfg.screenshotDir(), name);
@@ -102,6 +124,26 @@ function parseArgs(argv) {
   }
   if (!tags.length && !coverOnly) throw new Error('缺标签来源：传 --tags "a,b" 或 --tags-file bili-tags.txt（不再设默认标签，避免静默落错标签）');
 
+  // 2026-10-22：每平台独立日志（旁路，只多打不改原有 console 输出）
+  log = create({ platform: 'bilibili', kind: 'video' });
+
+  // 2026-10-22：起浏览器**之前**的体检（坑位⑯）。契约：不过就抛，别 catch 后继续。
+  if (!coverOnly) {
+    // 判据：①正文里的 undefined / NaN / [object Object]（上游生成 bug 外溢到线上内容的经典形态）
+    //        ②正文长度区间 ③标题长度
+    // 标题/简介上限（B站投稿页实测口径，2026-10-22 ego 通道回显「标题 12/80 + 简介 900/2000」）：
+    //   titleMax 80 字 / bodyMax 2000 字。超了平台会拒，体检直接拦下。
+    preflight({
+      platform: 'bilibili',
+      title: args.title,
+      bodyText: body,
+      limits: { titleMax: 80, bodyMax: 2000, bodyMin: 1 },
+    });
+    log.step('起浏览器前体检', '标题 ≤80 / 简介 ≤2000 + undefined 守卫');
+  } else {
+    log.step('起浏览器前体检', 'cover 补投模式，无正文，跳过');
+  }
+
   const browser = await chromium.connectOverCDP(CDP, { timeout: 15000 });
   const ctx = browser.contexts()[0];
   let p = ctx.pages().find((x) => /member\.bilibili\.com/.test(x.url()));
@@ -120,9 +162,30 @@ function parseArgs(argv) {
   await sleep(8000);
   if (/passport\.bilibili\.com/.test(p.url())) throw new Error('B站未登录: ' + p.url());
 
+  // 2026-10-22（坑位⑬）：**先预授权浏览器通知权限**，再上传。
+  //   B站上传完成会弹**浏览器级**通知权限对话框（不在页面 DOM 里，脚本点不掉）→
+  //   等不到页面 → 整条脚本硬停超时。预授权后那个框根本不弹。
+  //   ⚠ 合规的浏览器 API 调用：只是**授权通知**，不碰 profile、不清 cookie、不绕登录。
+  //   ⚠ 放在上传**之前**（不只是「等待表单之前」）：上传期间就可能弹框。
+  try {
+    const context = (p.context && typeof p.context === 'function') ? p.context() : ctx;
+    if (context && typeof context.grantPermissions === 'function') {
+      await context.grantPermissions(['notifications'], { origin: 'https://member.bilibili.com' });
+      console.log('已预授权浏览器通知权限（避免上传完成后的通知权限弹窗硬停）');
+      log.step('预授权通知权限', 'origin=https://member.bilibili.com');
+    } else {
+      console.log('提示：拿不到 BrowserContext，通知权限未预授权（上传后若弹权限框需人工点「允许」）');
+      log.warn('拿不到 BrowserContext，通知权限未预授权');
+    }
+  } catch (e) {
+    console.log('通知权限预授权未生效（' + e.message + '）——不影响主流程');
+    log.warn('通知权限预授权未生效：' + e.message);
+  }
+
   // 1) 上传视频（第一个 video accept input）
   await setVideoFile(p, 'input[type=file][accept*="mp4"]', path.resolve(args.video));
   console.log('视频已提交，等待表单展开…');
+  log.step('上传视频', path.basename(args.video));
   for (let i = 0; i < 15; i++) {
     await sleep(10000);
     const st = await p.evaluate(() => {
@@ -148,13 +211,24 @@ function parseArgs(argv) {
   const title = await p.$('input[placeholder="请输入稿件标题"]');
   await title.fill(args.title);
   console.log('标题已填');
-  // 4) 简介（contenteditable 富文本）
+  log.step('标题', args.title);
+  // 4) 简介（contenteditable 富文本，Quill）
+  //    2026-10-22 内化提速（坑位⑮）：逐字 type → fillLongText
+  //    （insertText 一次性插入 + 回读校验 + 对不上自动退回逐块输入）
   const ed = await p.$('.ql-editor, [contenteditable="true"]');
   if (ed) {
     await ed.click();
     await sleep(500);
-    await p.keyboard.type(body, { delay: 5 });
-    console.log('简介已填');
+    const readIntroLen = () => p.evaluate(() => {
+      const e = document.querySelector('.ql-editor, [contenteditable="true"]');
+      return e ? (e.innerText || e.textContent || '').trim().length : 0;
+    });
+    const usedFast = await fillLongText(p, readIntroLen, body, { step: 'bilibili' });
+    console.log(usedFast ? '简介已填（一次性插入 + 回读校验通过）' : '简介已填（退回逐块输入）');
+    log.step('简介', usedFast ? 'insertText 一次性插入（回读通过）' : '退回逐块输入');
+  } else {
+    console.log('警告：简介编辑器未找到');
+    log.warn('简介编辑器未找到，简介未填');
   }
   // 5) 标签（2026-10-05 七修，当日实证两坑）：①B站投稿页已改版为「输入后回车直接创建」
   //    ——原联想弹窗整个移除，旧「点精确联想项」逻辑永远找不到候选而全部跳过（当日 10 词
@@ -211,6 +285,8 @@ function parseArgs(argv) {
     console.log(missing.length
       ? '警告：每日标签有词未落上: ' + missing.join(',') + ' —— 发布前请人工补'
       : (selected.length === tags.length ? '每日标签全部落上 ✓（' + selected.length + '/' + tags.length + '）' : '每日标签全部落上 ✓（含 ' + (selected.length - tags.length) + ' 个复用词）'));
+    if (missing.length) log.warn('有 ' + missing.length + ' 个标签没落上: ' + missing.join(',') + ' —— 发布前请人工补');
+    else log.step('标签', selected.length + ' 个已落上');
   } else {
     console.log('警告：标签输入框未找到，本单无标签，发布前请人工补');
   }
@@ -251,6 +327,8 @@ function parseArgs(argv) {
       else console.log('分区点击未生效（回读: ' + JSON.stringify(cur) + '），重试…');
     }
     if (!zoneOk) console.log('警告：分区未设为「' + category + '」（保留系统推荐），发布前请人工改选');
+    if (zoneOk) log.step('分区', category + '（回读✓）');
+    else log.warn('分区未设为「' + category + '」（保留系统推荐）—— 发布前请人工改选');
   } catch (e) {
     console.log('警告：分区设置失败（' + String(e.message || e).slice(0, 100) + '）——保留系统推荐，发布前请人工改选「' + category + '」');
   }
@@ -390,21 +468,38 @@ function parseArgs(argv) {
         return { found: true, checked: true, x: r.x + r.width / 2, y: r.y + r.height / 2 };
       });
       if (sync.checked) { await p.mouse.click(sync.x, sync.y); console.log('已取消「双比例同步改动」（' + label + '）'); await sleep(800); }
+      // 2026-10-22（坑位⑭）：点上传入口后 filechooser 偶发唤不起来 → 最多点 3 次，
+      //   每次**重新取入口坐标**；3 次全失败才退回「弹窗内图片 input 直塞」（原兜底语义保留）。
+      //   ⚠ 从「合成 dispatchEvent click」改成**真实 mouse.click**（仓库惯例：合成 click
+      //     在别处会重置整页表单）。为让真实点击落点准确，候选里取**面积最小**的可见元素
+      //     ——点文字本身，不是那个大容器。
+      const locateCoverEntry = async () => p.evaluate(() => {
+        const vis = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+        const cands = [];
+        for (const el of document.querySelectorAll('.bcc-upload.cover-upload span, .bcc-upload.cover-upload div, .bcc-dialog div, .bcc-dialog span')) {
+          if (/^上传封面$/.test((el.textContent || '').trim()) && vis(el)) cands.push(el);
+        }
+        if (!cands.length) {
+          for (const el of document.querySelectorAll('.bcc-dialog div,span,button,a,label')) {
+            const t = (el.textContent || '').trim();
+            if (/上传封面|添加封面/.test(t) && vis(el) && el.getBoundingClientRect().height < 80) cands.push(el);
+          }
+        }
+        if (!cands.length) return null;
+        cands.sort((a, b) => {
+          const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+          return ra.width * ra.height - rb.width * rb.height;
+        });
+        const r = cands[0].getBoundingClientRect();
+        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+      });
       let fc = null;
       try {
-        [fc] = await Promise.all([
-          p.waitForEvent('filechooser', { timeout: 8000 }),
-          p.evaluate(() => {
-            const el = [...document.querySelectorAll('.bcc-upload.cover-upload span, .bcc-upload.cover-upload div, .bcc-dialog div, .bcc-dialog span')]
-              .find((x) => /^上传封面$/.test((x.textContent || '').trim()) && x.getBoundingClientRect().width > 0)
-            || [...document.querySelectorAll('.bcc-dialog div,span,button,a,label')].find((x) => /上传封面|添加封面/.test((x.textContent || '').trim()) && x.getBoundingClientRect().width > 0 && x.getBoundingClientRect().height < 80);
-            if (!el) return false;
-            const r = el.getBoundingClientRect();
-            el.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2 }));
-            return true;
-          }),
-        ]);
-      } catch (e) { fc = null; }
+        fc = await pickFileWithRetry(p, locateCoverEntry, { attempts: 3, timeout: 8000, step: 'bilibili-cover' });
+      } catch (e) {
+        log.warn(label + '：filechooser 3 次都没唤起（' + e.message + '）→ 退回 input 直塞');
+        fc = null;
+      }
       if (!fc) {
         const imgInput = await p.$('.bcc-dialog input[type=file][accept*="image"]').catch(() => null) || await p.$('input[type=file][accept*="image"]');
         if (!imgInput) throw new Error(label + '：「上传封面」未触发 filechooser 且无图片 input 可直塞');
@@ -476,6 +571,8 @@ function parseArgs(argv) {
     if (!slotsOk) console.warn('警告：双槽 canvas 不齐（期望 4:3+16:9 各一），请人工核对截图 ' + shotPath('bilibili.png'));
     await closeDialog();
     console.log(slotsOk && ok ? '封面已用自定义图落表单 ✓（' + (cover16File ? '4:3+16:9 双图分传' : '仅 4:3') + '）' : '警告：封面终验未全过，请人工核对截图');
+    if (slotsOk && ok) log.step('封面', (cover16File ? '4:3+16:9 双图分传' : '仅 4:3') + '（双槽 canvas 终验✓）');
+    else log.warn('封面终验未全过 —— 请人工核对截图 ' + shotPath('bilibili.png'));
   } else {
   // 原推荐帧路径
   const frame = await p.evaluate(() => {
@@ -506,5 +603,12 @@ function parseArgs(argv) {
   await p.screenshot({ path: SHOT });
   console.log('screenshot →', SHOT);
   console.log('STATUS: 已停在「提交投稿」按钮前，等待用户点击提交');
+  log.step('已停在「提交投稿」前', SHOT);
+  log.finish('ok');
   process.exit(0);
-})().catch((e) => { console.error('FATAL', e.message); process.exit(1); });
+})().catch((e) => {
+  console.error('FATAL', e.message);
+  // 异常路径也要把日志收尾（耗时表 + 告警汇总），否则失败时反而没有留痕
+  if (log) { try { log.finish('failed'); } catch (_) { /* 收尾失败不影响主流程 */ } }
+  process.exit(1);
+});

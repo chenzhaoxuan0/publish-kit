@@ -59,11 +59,30 @@
 //      每敲一个「#」都会弹出知乎话题联想面板，平台会把我们打的词顶替成热榜话题
 //      （实测「#英伟达 」→「#书单推荐」，DOM 里还落成 <a class="zed-topic">），
 //      正文被静默污染。insertText 不派发按键，联想面板不触发。
+//
+// ── 2026-10-22 内化（横向能力层接入）新增坑位 ────────────────────────
+//   ⑪ 点「本地图片上传」后 filechooser **偶发唤不起来**：坐标与成功那轮完全一致，
+//      文件选择器就是不弹（微博 / 抖音图文 / 抖音视频三平台都踩过）→ 整条线中止。
+//      处置：lib/wait.cjs 的 pickFileWithRetry —— 最多点 3 次，每次**重新取入口坐标**
+//      （弹窗重排后旧坐标会落空）。
+//   ⑫ 正文改用 lib/wait.cjs 的 fillLongText（insertText + 回读校验 + 对不上自动退回逐块输入）。
+//      ⚠ **它的兜底逐块输入在 Draft.js 上会触发话题联想**（同坑位⑩）——所以这里的
+//        「兜底」只当保险丝用：填完仍走本脚本原有的**严格回读校验**，不一致就抛错，
+//        **绝不**把被平台改写的正文交割出去（宁可炸掉，也不带脏稿交割）。
+//   ⑬ 体检（preflight）必须在 connectOverCDP **之前**；日志层是**旁路**，只多打不改原输出。
+//      图集张数判据用 preflight 的 mediaDir + declaredCount（它的 listImages 已认 img-01.png
+//      这套命名）；「目录里张数 > 声称张数」在体检之外单独提醒（多的图不会被传）。
 const fs = require('fs');
 const path = require('path');
 const cfg = require('../lib/config.cjs');
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const { chromium } = require('patchright');
+// 2026-10-22 内化：等待层（长文本一次性插入 / 上传入口重试）+ 日志层 + 起浏览器前体检
+const { sleep, fillLongText, pickFileWithRetry } = require('../lib/wait.cjs');
+const { create } = require('../lib/log.cjs');
+const { preflight, listImages } = require('../lib/preflight.cjs');
+
+// 每平台独立日志（旁路）。异常路径也要收尾，否则失败时反而没有留痕。
+let log = null;
 
 // 截图统一落 config.yaml 的 screenshot_dir（不写死在脚本旁边，也不留在这个仓库里）
 const shotPath = (name) => path.join(cfg.screenshotDir(), name);
@@ -143,6 +162,32 @@ function matchStripToSources(items, srcDims) {
   // 一路推进真实发布页，返工要删稿重发，这个洞不值得再踩一次）
   if (/undefined|NaN|\[object Object\]/.test(title + text)) throw new Error('[物料守卫] 正文含 undefined/NaN，先修文件再发');
 
+  // 2026-10-22：每平台独立日志（旁路，只多打不改原有 console 输出）
+  log = create({ platform: 'zhihu-pin', kind: 'image' });
+
+  // 2026-10-22：起浏览器**之前**的体检（坑位⑬）。契约：不过就抛，别 catch 后继续。
+  //   判据：①图集目录里实际有几张 vs 声称要传几张（mediaDir + declaredCount）
+  //        ②正文里的 undefined / NaN / [object Object] ③正文长度区间 ④标题长度
+  //   ⚠ 不设 titleMax：想法 V2 的标题框 maxLength=-1（非必填），没有字数上限口径；
+  //     bodyMax 2000 是粗筛（实测 1338 字正常通过，2026-10-22 ego 通道），不承担平台上限语义。
+  preflight({
+    platform: 'zhihu-pin',
+    mediaDir: media,
+    declaredCount: count,
+    title: title,
+    bodyText: text,
+    // ⚠ bodySoftMax 2000 是**粗筛**不是平台口径（实测 988 字正常）——
+    //   知乎想法的平台硬上限本仓库没有实测记录，用**软线**（超了只告警）。
+    //   硬闸必须有实测依据，否则口径一改就误拦合法稿件。
+    limits: { bodySoftMax: 2000, bodyMin: 1 },
+  });
+  // 体检之外再看一眼「目录里张数 > 声称张数」：多出来的图不会被传（只按 --count 取前 N 张），
+  // 但要提醒一声，免得以为 9 张都上去了。
+  const mediaInfo = listImages(media);
+  const actual = mediaInfo.exists ? mediaInfo.files.length : 0;
+  if (actual > count) console.log(`⚠ 目录里有 ${actual} 张图，本次只传前 ${count} 张（--count 指定）`);
+  log.step('起浏览器前体检', `图集 ${actual} 张 / 声称 ${count} 张 + 正文长度 + undefined 守卫`);
+
   const browser = await chromium.connectOverCDP(process.env.CDP_URL || cfg.cdpUrl(), { timeout: 15000 });
   const ctx = browser.contexts()[0];
 
@@ -219,6 +264,7 @@ function matchStripToSources(items, srcDims) {
       await sleep(600);
       const v = await ta.inputValue().catch(() => '');
       console.log('标题字段已填:', JSON.stringify(v), v === title ? '✓' : '✗ 回读不一致');
+      log.step('标题', v === title ? '已填（回读✓）' : '回读不一致');
       if (v !== title) throw new Error('标题字段回读不一致，疑似 React 未接收（填的是 "' + v + '"）');
     } else {
       text = `${title}\n${text}`;
@@ -326,10 +372,16 @@ function matchStripToSources(items, srcDims) {
         return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
       });
       if (!localPos) throw new Error('L2 已点开但未找到 Modal「本地图片上传」（页面改版？）');
-      const [chooser] = await Promise.all([
-        p.waitForEvent('filechooser', { timeout: 10000 }),
-        p.mouse.click(localPos.x, localPos.y),
-      ]);
+      // 2026-10-22（坑位⑪）：点「本地图片上传」后 filechooser 偶发唤不起来 → 整条线中止。
+      //   pickFileWithRetry：最多点 3 次，每次**重新定位入口**（弹窗重排后旧坐标会落空）。
+      const locateLocal = async () => p.evaluate(() => {
+        const el = [...document.querySelectorAll('button,div[role=button],a,span,li,div')]
+          .find((x) => (x.textContent || '').trim() === '本地图片上传' && x.getBoundingClientRect().width > 10);
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      });
+      const chooser = await pickFileWithRetry(p, locateLocal, { attempts: 3, timeout: 10000, step: 'zhihu-pin' });
       await chooser.setFiles([file]);
 
       // 等预览 blob 出现（Modal 上限 18 张；这里只上传 1 张）
@@ -424,6 +476,7 @@ function matchStripToSources(items, srcDims) {
     strip = await readStrip();
     m = matchStripToSources(strip.items, srcDims);
     console.log(`图片已上稿 ✓（图集区 ${strip.total} 张，与 ${count} 张源图匹配：宽高全等 ${m.exact} / 仅比例一致 ${m.ratio}）`);
+    log.step('传图', `图集区 ${strip.total} 张（与源图匹配 ${m.matched}/${count}）`);
 
   } else {
     console.log('⚠ --manual-images：已跳过自动配图，图集区为空；配图需人工补齐后再点发布');
@@ -450,7 +503,17 @@ function matchStripToSources(items, srcDims) {
   if (edPos && edPos.w > 0) await p.mouse.click(edPos.x, edPos.y);
   else await ed.click({ timeout: 8000 }).catch(() => {});
   await sleep(600);
-  await p.keyboard.insertText(text);
+  // 2026-10-22（坑位⑫）：正文改用 fillLongText —— insertText 一次性插入 + 回读校验，
+  //   对不上自动退回逐块输入。⚠ 逐块输入在 Draft.js 上会触发话题联想（同坑位⑩），
+  //   所以「退回」只当保险丝：填完仍走下面的**严格回读校验**，不一致就抛错，
+  //   绝不把被平台改写的正文交割出去。
+  const readEdLen = () => p.evaluate(() => {
+    const e = document.querySelector('.public-DraftEditor-content, [contenteditable="true"]');
+    return e ? (e.innerText || '').replace(/\u200b/g, '').trim().length : 0;
+  });
+  const usedFast = await fillLongText(p, readEdLen, text, { step: 'zhihu-pin' });
+  console.log(usedFast ? '正文已填（一次性插入 + 回读校验通过）' : '正文已填（退回逐块输入）');
+  log.step('正文', usedFast ? 'insertText 一次性插入（回读通过）' : '退回逐块输入');
   await sleep(1800);
   const state = await p.evaluate(() => {
     const e = document.querySelector('.public-DraftEditor-content, [contenteditable="true"]');
@@ -468,6 +531,7 @@ function matchStripToSources(items, srcDims) {
       + '\n  实际尾部: ' + JSON.stringify(norm(state.full).slice(-80)));
   }
   console.log('正文回读校验 ✓（与给定正文一致，未被平台改写）');
+  log.step('正文回读校验', '✓ 与给定正文一致，未被平台改写');
 
   // 3.5) 收尾复核：填完正文后图集区仍在位（正文输入不该把已传图清掉）
   if (!args['manual-images']) {
@@ -487,10 +551,18 @@ function matchStripToSources(items, srcDims) {
     return el ? { w: Math.round(el.getBoundingClientRect().width) } : null;
   });
   console.log('「发布」按钮:', pub ? `存在（未点击，w=${pub.w}）` : '未找到');
+  if (!pub) log.warn('没找到「发布」按钮（编辑态文案）—— 请人工确认页面状态');
   fs.mkdirSync(cfg.screenshotDir(), { recursive: true });
   const SHOT = shotPath('zhihu-pin.png');
   await p.screenshot({ path: SHOT, fullPage: false });
   console.log('screenshot →', SHOT);
   console.log('STATUS: 已停在「发布」前，等待用户人工点击');
+  log.step('已停在「发布」前', SHOT);
+  log.finish('ok');
   process.exit(0);
-})();
+})().catch((e) => {
+  console.error('FATAL', e.message);
+  // 异常路径也要把日志收尾（耗时表 + 告警汇总），否则失败时反而没有留痕
+  if (log) { try { log.finish('failed'); } catch (_) { /* 收尾失败不影响主流程 */ } }
+  process.exit(1);
+});

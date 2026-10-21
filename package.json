@@ -9,7 +9,9 @@
   "scripts": {
     "init": "node bin/init.cjs",
     "doctor": "node bin/doctor.cjs",
-    "login": "node bin/login.cjs"
+    "login": "node bin/login.cjs",
+    "publish-all": "node bin/publish-all.cjs",
+    "selftest": "node selftest.cjs"
   },
   "keywords": [
     "publish",

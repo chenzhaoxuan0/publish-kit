@@ -175,7 +175,14 @@ async function main() {
   out.publish = {
     declare_ai: await yesno('自动勾选「含 AI 生成内容」声明', true),
     screenshot_dir: './screenshots',
+    // 每平台运行日志目录（带时间戳每一步 + 收尾的步骤耗时倒序表 + 告警汇总）
+    log_dir: './logs',
   };
+  // 发布台账（可选）：配了 = 启用「防重复发布」闸门；不配 = 零行为变化。
+  // 问一句即可 —— 默认不启用，避免给只想填单的人增加心智负担。
+  if (await yesno('启用发布台账（防重复发布：同一条内容只发一次）', false)) {
+    out.publish.ledger = './publish-ledger.yaml';
+  }
 
   if (out.platforms.wechat && out.platforms.wechat.enabled) {
     console.log('\n  公众号走官方 API，需要你自己的凭证：');

@@ -323,9 +323,30 @@ async function kindOf(page) {
   const cmd = args._[0] || 'open';
   const kind = args.kind || 'image';
   if (kind !== 'image' && kind !== 'video') throw new Error('未知 --kind: ' + kind + '（可选 image|video）');
+  // 每平台独立日志 + 步骤耗时表（2026-10-22 内化）
+  // 用途：慢在哪不该靠猜。日志是**旁路**，不改变原有 console 输出行为。
+  const { create } = require('../lib/log.cjs');
+  const log = create({ platform: 'douyin', kind });
   // 截图统一落 config.yaml 的 publish.screenshot_dir（默认 ./screenshots），目录不存在即建
   const SHOT = path.join(cfg.screenshotDir(), kind === 'video' ? 'douyin-video.png' : 'douyin-image.png');
   fs.mkdirSync(path.dirname(SHOT), { recursive: true });
+  // ⚠️ 2026-10-22 内化（content 工作区 ego 通道实测）：**体检必须在起浏览器之前**。
+  //   「上传后确认成功」的判据只能证明**页面上的东西**，证明不了**喂进去的东西**。
+  //   真实事故：某平台的 images 只列了 1 张 → count=1 → 各平台只传了 1 张图，
+  //   而每个平台的判据都「通过」了（1 ≥ 1 恒成立）→ 脚本报成功，结果全是残缺图集。
+  //   → 起浏览器前就核对「声明要传几张」vs「目录里真有几张」，不过就不执行。
+  //   （原来这条检查排在 connectOverCDP **之后** —— 起完浏览器才检查，等于白检查。）
+  if (kind === 'image' && args.media && args.count) {
+    const preCount = parseInt(args.count, 10);
+    const preMedia = path.resolve(args.media);
+    const pre = require('../lib/preflight.cjs').preflight({
+      platform: 'douyin',
+      mediaDir: preMedia,
+      declaredCount: preCount,
+      limits: { titleMax: 30 },
+    });
+    if (pre.warn && pre.warn.length) console.warn(`[preflight:douyin] ${pre.warn.length} 条提醒`);
+  }
   const browser = await chromium.connectOverCDP(process.env.CDP_URL || cfg.cdpUrl(), { timeout: 15000 });
   const ctx = browser.contexts()[0];
 
@@ -383,28 +404,105 @@ async function kindOf(page) {
       if (!file || !fs.existsSync(file)) throw new Error('视频文件缺失: ' + file);
       await setVideoFile(page, 'input[type=file][accept*="video"]', file);
       console.log('已提交视频文件，等待上传与转码…');
+      log.step('上传视频', path.basename(file));
       // 等待转码出标题/发布表单：视频进度条消失或出现封面预览，超时兜底再等
       await page.waitForTimeout(30000);
+      log.step('视频上传 + 转码等待', '30s 固定等待');
     } else {
       const media = path.resolve(args.media || '.');
       const count = parseInt(args.count || '7', 10);
       const imgs = Array.from({ length: count }, (_, i) => path.join(media, `img-${String(i + 1).padStart(2, '0')}.png`));
       imgs.forEach((f) => { if (!fs.existsSync(f)) throw new Error(`图片缺失: ${f}`); });
-      // 页面有视频/图片两个 file input：按 accept 含 image 选图片输入框（且为 multiple）
-      // 2026-09-28 回退：直开 post/image 时 input 可能不挂载——点「点击上传」区拦截原生 filechooser 注入
-      try {
-        const input = await page.waitForSelector('input[type=file][accept*="image"]', { timeout: 8000, state: 'attached' });
-        await input.setInputFiles(imgs);
-      } catch (e) {
-        console.log('file input 未挂载，走「点击上传」区 filechooser 路径…');
-        const [chooser] = await Promise.all([
-          page.waitForEvent('filechooser', { timeout: 15000 }),
-          page.click('text=点击上传', { timeout: 10000, force: true }),
-        ]);
-        await chooser.setFiles(imgs);
+      // ⚠️ 2026-10-22 实测修正（content 工作区 ego 通道实测，本轮内化）：
+      //   ① **批量多选不可靠** —— 同一份代码同一个环境，给 6 张的结果在
+      //      6/6、1/6、0/6 之间跳（连测 8 次）。**单张上传是稳定的** → 改成逐张传，
+      //      每张传完等这一张的缩略图真的落位再传下一张。慢几秒，换确定性。
+      //   ② **「已添加 N 张图片」这个文字计数不可信** —— 它统计的是**上传队列**，
+      //      会在缩略图还没渲染落位时就显示 N。实测：文字说 6、截图只有 1 张、
+      //      几秒后 DOM 里 6 张都在。判据必须**数实际渲染出来的缩略图**。
+      //   ③ 缩略图是**延迟渲染**的 → 收尾要等实际缩略图数 == count 再截图。
+      //      数法：从「继续添加」按钮往上找含图的父容器，数其中 w>20 && h>20 的 <img>。
+      const countRendered = () =>
+        page.evaluate(() => {
+          // 定位「继续添加」按钮，它所在的含图容器就是图集区
+          let anchor = null;
+          for (const el of document.querySelectorAll('button,div[role=button],a,span')) {
+            if ((el.textContent || '').trim() === '继续添加') { anchor = el; break; }
+          }
+          let scope = anchor;
+          for (let i = 0; i < 8 && scope; i++) {
+            const imgs = [...scope.querySelectorAll('img')].filter((im) => {
+              const r = im.getBoundingClientRect();
+              return r.width > 20 && r.height > 20;
+            });
+            if (imgs.length) return imgs.length;
+            scope = scope.parentElement;
+          }
+          // 退化：全页里数大尺寸图（抖音首页没有别的 98×98 干扰，比微博安全）
+          return [...document.querySelectorAll('img')].filter((im) => {
+            const r = im.getBoundingClientRect();
+            return r.width > 20 && r.height > 20;
+          }).length;
+        });
+      // 逐张传（单张是稳定的）
+      let uploaded = 0;
+      for (const f of imgs) {
+        const ok = await (async () => {
+          try {
+            const input = await page.waitForSelector('input[type=file][accept*="image"]', { timeout: 8000, state: 'attached' });
+            await input.setInputFiles([f]);
+            return true;
+          } catch (e) {
+            // input 没挂载 → 点「点击上传」区走原生 filechooser
+            // ⚠️ 2026-10-22 内化：**入口偶发唤不起文件选择器**（坐标与成功那轮完全一致，
+            //   但 filechooser 就是不弹）—— 微博 / 抖音图文 / 抖音视频三个平台都踩过。
+            //   → pickFileWithRetry：最多点 3 次，每次**重新取入口坐标**（页面重排后旧坐标会落空）。
+            try {
+              const { pickFileWithRetry } = require('../lib/wait.cjs');
+              const chooser = await pickFileWithRetry(
+                page,
+                async () => {
+                  const pos = await page.evaluate(() => {
+                    const el = [...document.querySelectorAll('div,span,label')].find((x) => {
+                      const t = (x.textContent || '').trim();
+                      return /点击上传/.test(t) && /图片/.test(t) && x.children.length === 0;
+                    });
+                    if (!el) return null;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 5) return null;
+                    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+                  });
+                  return pos;
+                },
+                { attempts: 3, timeout: 15000, step: 'douyin' }
+              );
+              await chooser.setFiles([f]);
+              return true;
+            } catch (e2) {
+              console.warn('第 ' + (uploaded + 1) + ' 张没传上：' + e2.message);
+              return false;
+            }
+          }
+        })();
+        if (ok) uploaded++;
+        // 等这一张落位（缩略图延迟渲染）
+        await sleep(1500);
+        console.log(`已添加 ${uploaded}/${count} 张`);
       }
-      console.log(`已提交 ${count} 张图片，等待上传完成…`);
-      await page.waitForTimeout(15000);
+      // 收尾：等实际缩略图数 == count（不信文字计数）
+      const deadline = Date.now() + 25000;
+      let rendered = await countRendered();
+      while (rendered < count && Date.now() < deadline) {
+        await sleep(1000);
+        rendered = await countRendered();
+      }
+      if (rendered < count) {
+        console.warn(`⚠ 抖音只显示了 ${rendered}/${count} 张缩略图（按实际渲染数）—— 请人工核对`);
+        log.warn(`图集只渲染出 ${rendered}/${count} 张`);
+      } else {
+        console.log(`图集复核：${rendered}/${count} 张 ✓（按实际渲染数）`);
+        log.step('图集复核', `${rendered}/${count} 张（按实际渲染数）`);
+      }
     }
   }
 
@@ -448,8 +546,26 @@ async function kindOf(page) {
     const topicTags = (bodyNorm.match(/#[^\s#]+/g) || []).map((x) => x.slice(1));
     await editor.click();
     await page.waitForTimeout(500);
-    await page.keyboard.type(title ? main : `${args.title}\n${main}`, { delay: 3 });
-    console.log('描述正文已填');
+    // ⚠️ 2026-10-22 内化提速（content 工作区 ego 通道实测）：
+    //   逐字 keyboard.type 每敲一个字符都是一次 CDP 往返，N 个字符 = N 次往返。
+    //   实测 958 字：逐块 type 要 12s，insertText 约 0.6s，**省约 11s**。
+    //   ⚠️ insertText 不保证触发编辑器的 input 事件 → **必须回读校验**，
+    //      对不上要**自动退回**逐块输入，不能把半截正文交割出去。
+    //      （lib/wait.cjs 的 fillLongText 就是这个语义：insertText → 回读 → 退回逐块）
+    const bodyText = title ? main : `${args.title}\n${main}`;
+    const { fillLongText } = require('../lib/wait.cjs');
+    const usedFast = await fillLongText(
+      page,
+      async () =>
+        page.evaluate(() => {
+          const e = document.querySelector('.ql-editor, [contenteditable="true"]');
+          return e ? (e.innerText || e.textContent || '').trim().length : 0;
+        }),
+      bodyText,
+      { step: 'douyin' }
+    );
+    console.log(usedFast ? '描述正文已填（一次性插入 + 回读校验通过）' : '描述正文已填（退回逐块输入）');
+    log.step('描述正文', usedFast ? '一次性插入（insertText）' : '逐块输入（回退路径）');
     // 话题：**单轮 + 精确回删**（2026-10-22 重写）
     // ⚠️ 2026-10-22 实测报障（用户：「最后几个 tag 是混乱状态」）：
     //    10-21 期实测尾部是「#Anthropic #SpaceX #OpenAI #ChatGPT #v#AA大人AI日报人人工
@@ -632,6 +748,7 @@ async function kindOf(page) {
       console.log('话题另有 ' + overLimitTags.length + ' 个未填（已达抖音上限 ' + TOPIC_MAX + ' 个，非「话题库没有」）: ' + overLimitTags.join('/'));
     }
     console.log('话题已落地 ' + linked + ' 个 chip（正文 ' + baseLen + ' → ' + topicState.len + ' 字）');
+    log.step('话题', linked + ' 个 chip 落地' + (skippedTags.length ? '，跳过 ' + skippedTags.length : ''));
     await page.keyboard.press('Escape');
     await page.keyboard.press('Escape');
     console.log('描述已填写');
@@ -640,6 +757,12 @@ async function kindOf(page) {
   if (cmd === 'music') {
     // 抖音图文「配乐」：收藏 → 指定曲目 → 点「使用」
     // 2026-10-22 起自动化（之前一直是人工选「收藏配乐 Opus 37」）。
+    //
+    // ⚠️ **只有图文线有配乐入口**（视频线是视频自带音轨，没有这一步）。
+    //    视频线误用要**立刻报错**，不能静默失败让人以为配上了。
+    if (kind !== 'image') {
+      throw new Error('music 子命令仅支持 --kind image（视频线是视频自带音轨，没有配乐入口）');
+    }
     //
     // ── 地面真相（ego lite 真机探针实测，与 content 工作区 ego 通道同源）──
     //   ① 入口 = 扩展信息区「选择音乐」。⚠️ 页面上这文案出现**两次**：
@@ -790,20 +913,70 @@ async function kindOf(page) {
       if (!slotBox) throw new Error('封面槽位 ' + t.slot + ' 未找到');
       await page.mouse.click(slotBox.x, slotBox.y);
       await page.waitForTimeout(3000);
-      // 2) 校验编辑器标题为目标模式（防把横图传进竖编辑器）
-      const modeOk = await page.evaluate((want) => {
-        const modal = document.querySelector('.dy-creator-content-modal');
-        if (!modal) return false;
-        return [...modal.querySelectorAll('div,span')].some((x) => new RegExp('^' + want + '$').test((x.textContent || '').trim()));
+      // 2) 校验/切换编辑器模式（防把横图传进竖编辑器）
+      //    ⚠️ 2026-10-22 修正（content 工作区 ego 通道实测）：
+      //    原来判据是「`.dy-creator-content-modal` 里有没有标题文本恰为『设置竖封面』」。
+      //    两个问题：
+    //      a) **没步骤条 ≠ 错**。抖音在「某个封面已经设过」之后，再开另一个封面的
+    //         编辑器是**单模式直传面板**（只有「上传封面 + 点击上传文件或拖拽文件到这里」，
+    //         步骤条整个不渲染）→ 此时模式由「点的是哪个槽」决定，本来就必然对。
+    //         旧实现在这里 `throw` → **整条视频线 FATAL 中止**（封面其实是对的）。
+    //      b) 步骤条上「设置竖封面 / 设置横封面」是**两个 tab**，当前模式 =
+    //         class 含 **`step-active`** 的那一个。页面上另有一个 BUTTON 文本也是
+    //         「设置横封面」，但它带 `data-popupid` —— 那是**提示气泡触发器**，不是 tab。
+    //    → 做法：读 step-active 判定当前模式，不对就**点目标 tab**，再复核；
+    //      根本没有步骤条时**信任槽位**、告警后继续。
+      const mode = await page.evaluate((want) => {
+        const steps = [...document.querySelectorAll('div')].filter((e) => {
+          const t = (e.textContent || '').trim();
+          if (t !== '设置竖封面' && t !== '设置横封面') return false;
+          const cls = e.className?.toString?.() || '';
+          if (!cls.includes('step')) return false;
+          return e.getBoundingClientRect().width > 0;
+        });
+        const active = steps.find((e) => (e.className?.toString?.() || '').includes('active'));
+        const target = steps.find((e) => (e.textContent || '').trim() === want);
+        const tr = target ? target.getBoundingClientRect() : null;
+        return {
+          hasSteps: steps.length > 0,
+          activeText: active ? (active.textContent || '').trim() : '',
+          targetFound: !!target,
+          x: tr ? tr.x + tr.width / 2 : 0,
+          y: tr ? tr.y + tr.height / 2 : 0,
+        };
       }, t.want);
-      if (!modeOk) throw new Error('编辑器未进入「' + t.want + '」模式，中止防错传');
+      if (!mode.hasSteps) {
+        // 单模式直传面板 → 模式由所点槽位决定，本来就必然对 → 告警后继续，不 FATAL
+        console.warn('封面编辑器没有步骤条（单模式直传面板）→ 模式由所点槽位「' + t.slot + '」决定，继续');
+      } else if (mode.activeText !== t.want) {
+        console.log('封面编辑器当前在「' + (mode.activeText || '未知') + '」模式 → 切到「' + t.want + '」');
+        await page.mouse.click(mode.x, mode.y);
+        await sleep(1500);
+        const after = await page.evaluate((want) => {
+          const steps = [...document.querySelectorAll('div')].filter((e) => {
+            const t = (e.textContent || '').trim();
+            if (t !== '设置竖封面' && t !== '设置横封面') return false;
+            const cls = e.className?.toString?.() || '';
+            if (!cls.includes('step')) return false;
+            return e.getBoundingClientRect().width > 0;
+          });
+          const active = steps.find((e) => (e.className?.toString?.() || '').includes('active'));
+          return { activeText: active ? (active.textContent || '').trim() : '' };
+        }, t.want);
+        if (after.activeText !== t.want) {
+          throw new Error('封面编辑器未进入「' + t.want + '」模式（当前 ' + (after.activeText || '未知') + '），中止防错传（可能页面改版）。请人工在窗口里设' + t.slot + '。');
+        }
+      }
       // 3) 点编辑器内黑色「上传封面」按钮 → 原生 filechooser → setFiles
       //    （2026-09-22 修正：编辑器处于 AI封面模式，setInputFiles 塞 input 只会把图送进
       //    「生成参考图」列表，封面画布不变——必须走按钮的 filechooser 路径才真正上传）
-      const [fc] = await Promise.all([
-        page.waitForEvent('filechooser', { timeout: 8000 }).catch(() => null),
-        (async () => {
-          const pos = await page.evaluate(() => {
+      // ⚠️ 2026-10-22 内化：**入口偶发唤不起文件选择器**（三个平台都踩过）
+      //   → pickFileWithRetry：最多点 3 次，每次**重新取「上传封面」按钮坐标**。
+      const { pickFileWithRetry } = require('../lib/wait.cjs');
+      const fc = await pickFileWithRetry(
+        page,
+        async () =>
+          page.evaluate(() => {
             const modal = document.querySelector('.dy-creator-content-modal');
             const scope = modal || document;
             for (const el of scope.querySelectorAll('*')) {
@@ -814,13 +987,9 @@ async function kindOf(page) {
               }
             }
             return null;
-          });
-          if (!pos) return false;
-          await page.mouse.click(pos.x, pos.y);
-          return true;
-        })(),
-      ]);
-      if (!fc) throw new Error('「上传封面」未触发 filechooser');
+          }),
+        { attempts: 3, timeout: 10000, step: 'douyin-cover' }
+      );
       await fc.setFiles(t.file);
       console.log(t.label + ' 已通过 filechooser 提交: ' + path.basename(t.file));
       await page.waitForTimeout(4000);
@@ -895,5 +1064,15 @@ async function kindOf(page) {
   await page.screenshot({ path: SHOT, fullPage: false });
   console.log('screenshot →', SHOT);
   console.log('STATUS: 已停在发布按钮前，等待用户点击「发布」');
+  log.finish('ok');
   process.exit(0);
-})().catch((e) => { console.error('FATAL', e.message); process.exit(1); });
+})().catch((e) => {
+  console.error('FATAL', e.message);
+  // 异常路径也要把日志收尾（耗时表 + 告警汇总），否则失败时反而没有留痕
+  try {
+    require('../lib/log.cjs')
+      .create({ platform: 'douyin', kind: (() => { try { return parseArgs(process.argv.slice(2)).kind || 'image'; } catch (_) { return 'image'; } })() })
+      .finish('failed');
+  } catch (_) { /* 日志收尾失败不影响主流程 */ }
+  process.exit(1);
+});

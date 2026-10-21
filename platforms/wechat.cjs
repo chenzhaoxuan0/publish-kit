@@ -257,12 +257,32 @@ async function main() {
   console.log(`待上传 ${files.length} 张（首张即封面）：`);
   files.forEach((f) => console.log('  ' + path.basename(f)));
 
+  // ⚠️ 2026-10-22 内化：起浏览器/发 API **之前**的体检。
+  //   推草稿是「准交付」动作 —— 推错了要去后台删草稿重推，代价比浏览器填单高得多。
+  //   体检项：正文长度区间、正文里的 undefined/NaN、标题长度。
+  //   ⚠️ **不传 mediaDir/declaredCount**：公众号的图集规则与通用规则**语义不同** ——
+  //     通用规则按 `img-NN.png` 的序号归一；公众号是「cover 类最先、编号其次、end 类最后」
+  //     （见上面的 listImages），把 `cover-3x4.png` 交给序号解析会被当成「序号 3」。
+  //     公众号的张数与上限检查**已经由 listImages 自己做**（缺图 fail、超 20 张 fail），
+  //     这里不重复实现（同一段判定逻辑只保留一个实现）。
+  require('../lib/preflight.cjs').preflight({
+    platform: 'wechat',
+    bodyText: content,
+    title,
+    limits: { titleMax: TITLE_MAX, bodyMax: BODY_MAX, bodyMin: 1 },
+  });
+  const { create } = require('../lib/log.cjs');
+  const log = create({ platform: 'wechat', kind: 'image' });
+  log.step('素材清单', `${files.length} 张`);
+  log.step('标题', `${[...title].length} 字`);
+
   const mediaIds = [];
   for (const f of files) {
     const mediaId = await uploadImage(token, f);
     mediaIds.push(mediaId);
     console.log(`  已传永久素材：${path.basename(f)} → …${mediaId.slice(-6)}`);
   }
+  log.step('永久素材上传', `${mediaIds.length} 张`);
 
   const draft = await pushDraft(token, { title, content, mediaIds });
   if (!draft.media_id) {
@@ -270,6 +290,8 @@ async function main() {
     fail(`推草稿失败：${JSON.stringify(draft)}`);
   }
   ok(`贴图草稿已入草稿箱（newspic，${mediaIds.length} 图），media_id 尾号 …${draft.media_id.slice(-6)}`);
+  log.step('草稿已入箱', `media_id 尾号 …${draft.media_id.slice(-6)}`);
+  log.finish('ok');
   console.log('\n下一步（契约，人工）：');
   console.log('  1. mp.weixin.qq.com「内容管理-草稿」核对贴图样式，点「发布」；');
   console.log('  2. 发布成功后回填你自己的发布记录（状态 + 文章链接）；');

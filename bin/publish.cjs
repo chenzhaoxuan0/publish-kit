@@ -8,6 +8,7 @@
 //   publish-kit login [平台...]        打开平台登录页
 //   publish-kit init                   首次配置向导
 //   publish-kit platforms              列出各平台脚本与用法
+//   publish-kit publish-all [参数]     并行填单多个平台（详见 publish-all.cjs 头部）
 //   publish-kit help                   本帮助
 const fs = require('fs');
 const path = require('path');
@@ -48,6 +49,7 @@ publish-kit —— 多平台图文/视频自动填单，只填到发布按钮前
   publish-kit login [平台...] [--all] 打开平台登录页（只开页面，不碰登录按钮）
   publish-kit init                   首次配置向导，生成 config.yaml
   publish-kit platforms              列出各平台脚本与用法
+  publish-kit publish-all [参数]     并行填单多个平台（详见 publish-all.cjs 头部）
 
 各平台脚本需在 publish-kit 目录下直接执行，例如：
   node platforms/zhihu.cjs --video a.mp4 --title "标题" --body-file desc.txt
@@ -61,6 +63,7 @@ switch (CMD) {
   case 'login': run('login.cjs', REST); break;
   case 'init': run('init.cjs', REST); break;
   case 'platforms': platformsList(); break;
+  case 'publish-all': run('publish-all.cjs', REST); break;
   case 'help':
   case '-h':
   case '--help':

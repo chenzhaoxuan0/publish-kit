@@ -8,6 +8,13 @@ wechat-ip.json
 # 截图留档
 screenshots/
 
+# 每平台运行日志（含步骤耗时与告警，量大会撑爆仓库）
+logs/
+
+# 发布台账（可能含内容标识与发布链接，属本地运行状态）
+publish-ledger.yaml
+publish-ledger.yaml.tmp
+
 # 专用浏览器 profile：里面是各平台登录态（cookie/token），绝不入库
 .browser-profile/
 

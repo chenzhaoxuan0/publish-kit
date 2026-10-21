@@ -106,6 +106,29 @@ node platforms/wechat.cjs push --media <目录> --title "..." --body-file <f.txt
 
 改选择器时**先读对应注释**，不要靠反复实跑试探。
 
+### ⚠️ 调试纪律：先抓地面真相（这一条救过最多的时间）
+
+自动化里出现「**逻辑看着对，但结果恒为空 / 恒失败**」时，**先证明代码在跑的那份和以为在跑的是同一份**，
+再谈修法。修法顺序：
+
+1. **写探针脚本，在真机上 dump 地面真相** —— 逐值打印中间量，不要只打印最终结果。
+   探针要打的是**判定过程的每一步**：命中了哪个元素、算出了什么值、哪一步返回了空。
+2. **探针里 import 真实模块、调真实函数**，与 DOM 快照**同刻对照**。
+   读代码 ≠ 代码在跑；`import` 真模块调真函数才是。
+3. **每轮改动只改一处**，否则无法归因。
+
+**同一个判定逻辑只保留一个实现。** 本项目栽过：`findSong` 和 `findUseButton`
+两个函数逻辑看着一样，真机上 `findSong` 返回按钮、`findUseButton` 恒返回 null，
+排查绕了 **8 轮**。两份实现必然漂移 —— 改的时候要一起改，但更好的是**只有一份**。
+
+**别在同一个假设上调参数。** 第一版方向错了以后，继续加轮次/加等待/改超时只会越改越乱。
+2026-10-22 抖音话题的教训：第一版假设「联想面板前缀替换」，照这个假设改了两次都失败；
+真机探针一打，发现真因是**面板会把你输入的词回显成浏览量 0 的假候选** —— 与原假设无关。
+
+**面板型联想 UI 的「候选存在性」不能只看文本匹配。** 必须找一个「这条候选是真的」的区分特征
+（抖音 = 浏览量 > 0；微博 = 面板里有没有这一项）。抖音的话题库里没有某个词时，
+面板照样显示「#ZZZ不存在话题 0」—— 只按精确名匹配会把假候选当真，点下去不落 chip。
+
 ### 大文件
 
 >48MB 的视频不能直接 `setInputFiles`。所有视频上传统一走
@@ -129,6 +152,42 @@ node platforms/wechat.cjs push --media <目录> --title "..." --body-file <f.txt
 | 图文 | 知乎想法 | `zhihu-pin.cjs` | `--media`、`--count`；无独立标题框，标题并入首行 |
 | 图文 | 公众号 | `wechat.cjs` | `ip`/`check`/`push`；终点草稿箱 |
 
+### 横向能力层（**优先用它，别手写**）
+
+各平台脚本只管「这个平台怎么填」，通用能力在 `lib/`。写新平台脚本时按这个分工：
+
+| 需求 | 用什么 |
+|---|---|
+| 等某个东西出现 | `lib/wait.cjs` 的 `waitFor(fn, {timeout, interval, step, hint})` |
+| 人看的停顿 | `lib/wait.cjs` 的 `humanDelay(min, max, step)`（**不要**拿它当等待条件） |
+| 灌长文本 | `lib/wait.cjs` 的 `fillLongText(page, readLength, text)`（自带回读校验 + 自动退回逐块输入） |
+| 上传入口点击 | `lib/wait.cjs` 的 `pickFileWithRetry(page, locateEntry)`（最多重试 3 次，每次重新取坐标） |
+| 记录耗时与告警 | `lib/log.cjs` 的 `create({platform, kind})` → `log.step() / log.warn() / log.finish()` |
+| 起浏览器前体检 | `lib/preflight.cjs` 的 `preflight({...})`（图集张数 / 正文长度 / 违禁 / 标题） |
+| 防重复发布 | `lib/ledger.cjs`（**可选**，配了 `publish.ledger` 才启用） |
+| 多平台并行 | `bin/publish-all.cjs`（不要自己写调度） |
+
+⚠️ **不要绕过 `lib/bigfile-upload.cjs`**：>48MB 的视频必须走它的 `setVideoFile()`，
+微博必须走 `resolveOpenFileChooser()`。
+
+⚠️ **preflight 抛错时不要 catch 后继续** —— 契约是「体检不过就不起浏览器」。
+
+⚠️ **登录态判据暂时没收敛** —— `lib/platforms.cjs` 有张统一表，但 6 个平台脚本各自保留着
+自己的就地判据（有的判 URL 跳 `passport`、有的判页面上某个按钮在不在）。
+这是**有意为之**：各平台的判据确实不同（知乎判「发想法」按钮、视频号判壳首页），
+而判据都紧跟在导航之后，就地判定最可靠。**不要为了「统一」去动它** ——
+统一判据的改动风险大于收益。真要动，逐个平台核对过再改。
+
+### 自检
+
+改完 `lib/` 下的模块后跑：
+
+```bash
+node selftest.cjs      # 33 项，覆盖等待/日志/体检/台账/编排
+```
+
+平台脚本的改动至少跑一次 `node --check platforms/<file>.cjs`。
+
 ---
 
 ## 出问题时
@@ -142,5 +201,8 @@ node platforms/wechat.cjs push --media <目录> --title "..." --body-file <f.txt
 | `某平台未登录/字段未配置` | 正常。脚本会跳过并告警，转人工处理，**不要自己编一个值填上** |
 | 选中的元素点不动 | 很可能需要真实 mouse.click 而非合成 click，读该平台的坑位注释 |
 | 视频传不进去（>50MB） | 确认走的是 `setVideoFile()`，不要自己写 `setInputFiles` |
+| 判定恒为空 / 恒失败 | **先写探针抓地面真相**，别在同一个假设上调参数（见上面「调试纪律」） |
+| 图集体检说「缺 01, 02」但文件明明在 | 命名约定：`img-01.png` / `01.png` / `card_34_01.png` 都认；改 `lib/preflight.cjs` 的 `listImages` 时注意 |
 
 改完任何平台脚本后，至少跑一次 `node --check platforms/<file>.cjs`。
+改完 `lib/` 下任何模块后，跑一次 `node selftest.cjs`。

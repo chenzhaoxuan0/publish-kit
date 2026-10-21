@@ -66,12 +66,35 @@
 //   tag 形态（2026-09-22）：body 内 #词 空格分隔的纯文本，微博正文自动解析为话题；
 //   联想下拉点选已实验（_item_ 候选+自动补 #词#）但新品词无候选+前缀替换碎片问题，
 //   故对无精确候选的词降级为纯文本组接尾（2026-09-22 夜）。
+//
+//   ── 2026-10-22 接入横向能力层（lib/wait.cjs / lib/log.cjs / lib/preflight.cjs）──
+//   ⑨ 点上传入口**偶发唤不起文件选择器**（坐标与成功那轮完全一致；微博 / 抖音图文 /
+//      抖音视频三个平台都踩过）→ 所有「点入口 → filechooser」一律走
+//      pickFileWithRetry：最多 3 次，每次**重新定位入口并重取坐标**
+//      （页面重排后旧坐标会落空）。本文件原有的两套自制重试（封面 2 次循环、
+//      视频入口一次）已全部并入 pickFileWithRetry —— 两份实现必然漂移，这是本轮教训。
+//   ⑩ 正文是**纯 textarea**（与首页九宫格同一个组件），keyboard.insertText 对它
+//      是否生效**未实测**（知乎那种 Draft.js contenteditable 已实测 insertText 有效，
+//      微博没有同类证据）→ 所以正文填充一律走 fillLongText：insertText 一次灌入 →
+//      回读字数校验 → 对不上自动清空并退回逐块输入。
+//      **不要写裸 insertText**：回读 + 自动退回是这个场景的安全网，不是可选装饰。
+//      逐字 type 958 字要 12s，insertText 约 0.6s。
+//   ⑪ 起浏览器前先体检（preflight）：正文里的 undefined/NaN/[object Object]（上游
+//      生成 bug 外溢到线上内容）、正文长度上限、标题长度（微博投稿表单标题框
+//      maxlength=30，超了会被浏览器静默截断）。体检不过就抛错中止，**不起浏览器**。
 const fs = require('fs');
 const path = require('path');
 const cfg = require('../lib/config.cjs');
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const { chromium } = require('patchright');
 const { setVideoFile, resolveOpenFileChooser } = require('../lib/bigfile-upload.cjs');
+// 横向能力层：等待/日志/体检三件事统一走 lib/，平台脚本不再各写各的 sleep 与轮询
+const { sleep, pickFileWithRetry, fillLongText } = require('../lib/wait.cjs');
+const { create } = require('../lib/log.cjs');
+const { preflight } = require('../lib/preflight.cjs');
+
+// 运行日志器（**旁路**：只多打印，不改变任何既有 console.log 的行为与时机）。
+// 放模块作用域是为了让末尾的 .catch() 也能收尾（异常路径要写 failed）。
+let log = null;
 
 // 截图统一落 config.yaml 的 publish.screenshot_dir（不写死在脚本旁边）
 const shotPath = (name) => path.join(cfg.screenshotDir(), name);
@@ -309,6 +332,30 @@ function parseArgs(argv) {
   const body = args['body-file'] ? fs.readFileSync(path.resolve(args['body-file']), 'utf-8').trim() : '';
   const text = args.title ? `${args.title}\n${body}` : body;
 
+  // 运行日志器（旁路）。放在参数校验之后：参数就不对的调用不该留下日志文件。
+  log = create({ platform: 'weibo', kind: 'video' });
+  log.step('参数校验', '模式=' + (sub || '一条龙'));
+
+  // ── 起浏览器前体检（2026-10-22 加，坑位⑪）──────────────────────────
+  // 契约：体检不过 → 抛错中止，**不 catch**（宁可不发，也不发错）。
+  // 判据（微博口径）：
+  //   ① 正文含 undefined / NaN / [object Object] —— 上游生成 bug 外溢到线上内容
+  //   ② 正文 ≤ 2000 字 —— ⚠️ **这条没有实测依据**，按「软线」处理（超了只告警）。
+  //      微博正文的平台硬上限在本仓库**没有实测记录**（仓库既有口径是 900 字
+  //      **信噪比软线**，见 news-card-kit 的平台字数护栏）。硬闸必须有实测依据，
+  //      否则平台一改口径就误拦；超长由平台自己拦即可。
+  //   ③ 标题 ≤ 30 字 —— 这条**有实测依据**：微博投稿表单的标题框 DOM 上就写着
+  //      maxlength=30（见下方 tSel 选择器），超了浏览器会静默截断，等于发出去的
+  //      标题和稿件对不上。与知乎那种「口径未确认」的标题不同，这里不是猜的。
+  //   —— 只有真的有正文/标题时才查：cover / channel / statement 三种补投模式
+  //      本来就不带正文，不该被空正文判失败。
+  preflight({
+    platform: 'weibo',
+    title: args.title || undefined,
+    bodyText: (args['body-file'] || args.title) ? text : undefined,
+    limits: { titleMax: 30, bodySoftMax: 2000, bodyMin: 1 },
+  });
+
   const browser = await chromium.connectOverCDP(CDP, { timeout: 15000 });
   const ctx = browser.contexts()[0];
   const weiboTabs = ctx.pages().filter((x) => /weibo\.com/.test(x.url()) && !/passport/.test(x.url()));
@@ -342,6 +389,7 @@ function parseArgs(argv) {
     await p.goto('https://weibo.com/upload/channel', { timeout: 45000, waitUntil: 'domcontentloaded' }).catch(() => {});
     await sleep(8000);
     if (/passport\.weibo|signin|newlogin/.test(p.url())) throw new Error('微博未登录: ' + p.url());
+    log.step('开页', p.url());
     if (keepTabs) {
       // 只护栏新页：新开页若把草稿恢复出来了（旧文），同样不能让它混进新填正文
       const filled = await p.evaluate(() => [...document.querySelectorAll('textarea, [contenteditable="true"]')]
@@ -360,19 +408,29 @@ function parseArgs(argv) {
   const videoPath = path.resolve(args.video);
   let videoConfirmed = false;
   try {
-    const btn = await p.waitForSelector('button:has-text("上传视频")', { timeout: 15000 });
-    const chooserPromise = p.waitForEvent('filechooser', { timeout: 10000 });
-    await btn.click();
-    const chooser = await chooserPromise;
+    // 坑位⑨：入口偶发点了不弹文件选择器 → pickFileWithRetry 最多 3 次。
+    //   每次都**重新定位入口并重取坐标**（页面重排后旧坐标会落空）：
+    //   waitForSelector → scrollIntoViewIfNeeded → boundingBox（视口坐标）。
+    const locateUploadVideo = async () => {
+      const btn = await p.waitForSelector('button:has-text("上传视频")', { timeout: 8000 }).catch(() => null);
+      if (!btn) return null;
+      await btn.scrollIntoViewIfNeeded().catch(() => {});
+      const box = await btn.boundingBox().catch(() => null);
+      if (!box || !box.width || !box.height) return null;
+      return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+    };
+    const chooser = await pickFileWithRetry(p, locateUploadVideo, { attempts: 3, timeout: 15000, step: 'weibo-video' });
     // 大文件不能走 chooser.setFiles（50MB 上限），但 UI 又必须由这个 chooser 触发，
     // 所以接住事件后改用原生 CDP 给同一个 file input 赋值（2026-09-28 大文件实测）。
     const viaCdp = await resolveOpenFileChooser(p, videoPath);
     if (!viaCdp) await chooser.setFiles(videoPath);
     videoConfirmed = true;
     console.log(`视频已提交（filechooser${viaCdp ? ' + CDP 原生直传' : ''}），等待上传完成…`);
+    log.step('上传视频', path.basename(videoPath) + (viaCdp ? '（CDP 原生直传）' : ''));
   } catch (e) {
     const input = await setVideoFile(p, 'input[type=file][accept*="video/mp4"]', videoPath, 0, { timeout: 10000 });
     console.log(`视频已提交（input 直传 ${input} 通道），等待缩略图…`);
+    log.warn('视频上传入口未走通（' + String(e.message || e).slice(0, 120) + '），已降级为 input 直传（' + input + ' 通道）——注意该路径不一定能触发上传');
   }
   // 等上传完成。判定必须有正面 DOM 证据：表单内出现 <video> 元素——
   // 仅凭页面文本「上传完成」会假阳性（2026-09-24 两次实证：文本命中但视频实际未进表单，用户两次看到空表单）
@@ -408,7 +466,7 @@ function parseArgs(argv) {
       throw new Error(`微博已静默回到空白上传态（t+${(i + 1) * 3}s），上传未生效。当前文件 ${videoMb.toFixed(1)}MB——`
         + '微博对大文件会静默失败且不报错，先出上传优化版（建议 ≤35MB）再重跑');
     }
-    if ((st.videoEl || st.formUp) && st.done && !st.uploading) { console.log(`上传完成（t+${(i + 1) * 3}s，${st.videoEl ? 'video 元素有 src' : '表单已展开'}）`); uploadVerified = true; break; }
+    if ((st.videoEl || st.formUp) && st.done && !st.uploading) { console.log(`上传完成（t+${(i + 1) * 3}s，${st.videoEl ? 'video 元素有 src' : '表单已展开'}）`); log.step('上传完成', 't+' + (i + 1) * 3 + 's（' + videoMb.toFixed(1) + 'MB）'); uploadVerified = true; break; }
     if (i % 5 === 0) console.log(`上传中… t+${(i + 1) * 3}s（video 有 src: ${st.videoEl} / 表单已展开: ${st.formUp}）`);
   }
   if (!uploadVerified) {
@@ -454,8 +512,11 @@ function parseArgs(argv) {
     const decl = await selectStatement(p);
     if (decl.ok) console.log('内容声明已选「含AI生成内容」✓（控件回读: ' + JSON.stringify(decl.display) + '）');
     else console.error('⚠ 内容声明未选中（' + decl.diag + '）——微博必填项，发送前请人工在下拉里选「含AI生成内容」');
+    if (decl.ok) log.step('内容声明', '含AI生成内容');
+    else log.warn('内容声明未选中（' + decl.diag + '）——微博必填项，发送前请人工在下拉里选「含AI生成内容」');
     } else {
       console.log('publish.declare_ai = false，跳过内容声明（未碰声明控件；该稿件是否需要声明由你自己确认）');
+      log.warn('publish.declare_ai = false，已跳过内容声明（该稿件是否需要声明由你自己确认）');
     }
     const tSel = 'input[placeholder*="标题"], input[maxlength="30"]';
     if (await p.$(tSel)) {
@@ -463,6 +524,7 @@ function parseArgs(argv) {
       await p.fill(tSel, args.title || '');
       titleFieldFilled = true;
       console.log('投稿表单：类型/标题已补选，标题 =', await p.$eval(tSel, (e) => e.value));
+      log.step('填标题', String(args.title || '').slice(0, 40));
     }
   }
   // 2) 文字（composer textarea）
@@ -481,6 +543,12 @@ function parseArgs(argv) {
   if (box.y < 0 || box.y > 900) throw new Error('composer 不在视口内（y=' + Math.round(box.y) + '），滚动失败');
   await p.mouse.click(box.x, box.y);
   await sleep(800);
+  // 坑位⑩：insertText 落在「当前焦点元素」上。鼠标点的是编辑器内偏移 30px 的位置，
+  //   可能落在没聚焦的边角 → 把焦点显式钉死在 composer 上，insertText 才有落点。
+  await p.evaluate(() => {
+    const e = document.querySelector('textarea[placeholder*="新鲜事"], [contenteditable="true"]');
+    if (e && e.focus) e.focus();
+  }).catch(() => {});
   // 3) 文字两轮法（2026-09-22）：正文直输；#tag 逐个「探测→选中」，无精确话题的以纯文本组接尾。
   //    微博联想为前缀替换式：未选中词残留会被后续点选整段吞掉产生碎片，故正式输入前先全量探测。
   //    候选稳定化：_item_ 候选 scrollIntoView({block:'center'}) + sleep 后双次取坐标（面板随
@@ -507,10 +575,23 @@ function parseArgs(argv) {
     console.log(
       `文字已填（#tag# 原样输入，回读 ${len0.length} 字；服务端按 #tag# 识别话题，不做联想点选）`
     );
+    log.step('填正文', len0.length + ' 字（#tag# 原样输入）');
   } else {
-    await p.keyboard.type(main, { delay: 2 });
+    // 坑位⑩：正文是纯 textarea，insertText 是否生效**未实测** → 走 fillLongText：
+    //   insertText 一次灌入 → 回读字数 → 对不上就自动清空并退回逐块输入。
+    //   逐字 type 958 字要 12s，insertText 约 0.6s；回读与自动退回路是这个场景的安全网。
+    //   回读口径与脚本末尾的 verify 一致：textarea 取 .value，contenteditable 取 innerText。
+    const readComposerLen = async () => p.evaluate(() => {
+      const e = document.querySelector('textarea[placeholder*="新鲜事"], textarea._input_1rz8r_8')
+        || document.querySelector('[contenteditable="true"]');
+      if (!e) return 0;
+      const v = e.value !== undefined ? e.value : (e.innerText || e.textContent || '');
+      return [...String(v)].length;
+    }).catch(() => 0);
+    const viaInsert = await fillLongText(p, readComposerLen, main, { step: 'weibo-body' });
     await p.keyboard.press('Control+End');
     await sleep(300);
+    log.step('填正文', main.length + ' 字（' + (viaInsert ? 'insertText 一次性' : '逐块输入（已回退）') + '）');
   }
   const findCand = async (kw) => {
     for (let i = 0; i < 6; i++) {
@@ -693,6 +774,7 @@ function parseArgs(argv) {
   });
   if (verify.len < 50) throw new Error('composer 回读 len=' + verify.len + '，文字未落表单（head=' + JSON.stringify(verify.head) + '）');
   console.log('文字已填（话题下拉选中 ' + linked + '，纯文本 ' + plainTags.length + '，回读 ' + verify.len + ' 字：' + JSON.stringify(verify.head) + '…）');
+  log.step('话题', '联想选中 ' + linked + ' 个 / 纯文本 ' + plainTags.length + ' 个（正文回读 ' + verify.len + ' 字）');
   // 3.2) 分类频道：级联双栏（结构与坑位见文件头 selectChannel 的注释）
   //      未配置 channel_hint 且命令行也没给 --channel → 整段跳过、不点下拉 + 告警。
   //      不内置任何默认分类：猜错的分类会静默落到发布页上，用户在发布前不一定会发现；
@@ -701,16 +783,20 @@ function parseArgs(argv) {
   const channelSub = args.sub || null;
   if (!channel) {
     cfg.warnSkipped('weibo', 'channel_hint', '微博分类频道');
+    log.warn('微博分类频道未配置（platforms.weibo.channel_hint 为空）——已在发布页留空，发布前请手动选择');
   } else {
     try {
       const r = await selectChannel(p, channel, channelSub);
       if (r.ok) {
         console.log('分类频道已选（' + channel + (r.clicked2 ? ' / ' + r.clicked2 : '') + '，控件回读: ' + r.display + '）✓');
+        log.step('分类频道', channel + (r.clicked2 ? ' / ' + r.clicked2 : ''));
       } else {
         console.log('警告：分类频道填写失败（' + r.diag + '）——转人工，发布前请在表单手选「' + channel + '」');
+        log.warn('分类频道填写失败（' + r.diag + '）——转人工，发布前请在表单手选「' + channel + '」');
       }
     } catch (e) {
       console.log('警告：分类频道填写失败（' + String(e.message || e).slice(0, 120) + '）——转人工，发布前请在表单手选「' + channel + '」');
+      log.warn('分类频道填写失败（' + String(e.message || e).slice(0, 120) + '）——转人工，发布前请在表单手选「' + channel + '」');
     }
   }
   }
@@ -721,10 +807,14 @@ function parseArgs(argv) {
     console.log('screenshot →', SHOT);
     if (!r.ok) {
       console.error('FATAL 分类频道未选中（' + r.diag + '）——表单未被改动，请人工在下拉里手选');
+      log.warn('分类频道未选中（' + r.diag + '）——表单未被改动，请人工在下拉里手选');
+      log.finish('failed');
       process.exit(1);
     }
     console.log('分类频道已选（' + args.channel + (r.clicked2 ? ' / ' + r.clicked2 : '') + '，控件回读: ' + r.display + '）✓');
     console.log('STATUS: 已停在「发送」按钮前，等待用户点击发送');
+    log.step('收尾', '停在「发送」按钮前（channel 模式）');
+    log.finish('ok');
     process.exit(0);
   }
   if (statementOnly) {
@@ -735,8 +825,10 @@ function parseArgs(argv) {
     else console.log('内容声明已选「含AI生成内容」✓（控件回读: ' + JSON.stringify(r.display) + '）');
     await p.screenshot({ path: SHOT, timeout: 15000 }).catch((e) => console.log('截图失败（' + String(e.message || e).slice(0, 60) + '），跳过留档'));
     console.log('screenshot →', SHOT);
-    if (!r.ok) process.exit(1);
+    if (!r.ok) { log.warn('内容声明未选中（' + r.diag + '）'); log.finish('failed'); process.exit(1); }
     console.log('STATUS: 已停在「发送」按钮前，等待用户点击发送');
+    log.step('收尾', '停在「发送」按钮前（statement 模式）');
+    log.finish('ok');
     process.exit(0);
   }
   // 3.5) 自定义封面（--cover；微博用竖封面 3:4，2026-09-21 经实测确定）
@@ -775,24 +867,25 @@ function parseArgs(argv) {
       });
     };
     let fc = null;
-    for (let attempt = 0; attempt < 2 && !fc; attempt++) {
-      const pos = await locateEntry();
-      if (!pos) throw new Error('「上传封面」入口未找到（表单未展开？）');
-      if (pos.misHit) throw new Error('入口被遮挡（elementFromPoint=' + pos.misHit + '）——禁止盲点：误点「删除」会清空表单（2026-09-25 实证）。请人工上传封面。');
-      try {
-        [fc] = await Promise.all([
-          p.waitForEvent('filechooser', { timeout: 15000 }),
-          p.mouse.click(pos.x, pos.y),
-        ]);
-        await fc.setFiles(coverFile);
-        console.log('自定义封面已提交（UI filechooser 路径）:', path.basename(args.cover));
-      } catch (e) {
-        fc = null;
-        if (attempt === 0) { console.log('filechooser 未触发，重定位入口后重试一次…'); continue; }
-        throw new Error('「上传封面」两次点击均未弹 filechooser。input 直塞回退已废除（绕过 UI 时 cropper 不出现）。请人工上传封面，勿再驱动本页。');
-      }
+    // 坑位⑨：封面入口同样偶发点了不弹文件选择器 → 统一走 pickFileWithRetry（最多 3 次，
+    //   每次**重新定位入口并重取坐标**）。本文件原来这里是自制的 2 次重试循环，
+    //   与 lib/ 那份必然漂移 —— 已并成一份。
+    try {
+      fc = await pickFileWithRetry(p, async () => {
+        const pos = await locateEntry();
+        if (!pos) return null;   // 入口没找到 → 可重试（表单可能还没展开）
+        if (pos.misHit) {
+          // 遮挡是**硬错误**：这里盲点会误点「删除」清空整页表单（2026-09-25 实证），不能重试。
+          throw new Error('入口被遮挡（elementFromPoint=' + pos.misHit + '）——禁止盲点：误点「删除」会清空表单（2026-09-25 实证）。请人工上传封面。');
+        }
+        return pos;
+      }, { attempts: 3, timeout: 15000, step: 'weibo-cover' });
+      await fc.setFiles(coverFile);
+    } catch (e) {
+      throw new Error('「上传封面」提交失败（' + e.message + '）。input 直塞回退已废除（绕过 UI 时 cropper 不出现）。请人工上传封面，勿再驱动本页。');
     }
-    if (!fc) throw new Error('封面未能提交');
+    console.log('自定义封面已提交（UI filechooser 路径）:', path.basename(args.cover));
+    log.step('上传封面', path.basename(args.cover));
     // 3.5b) cropper 弹窗确认按钮：轮询 30s，只认 BUTTON（div/span 同名文本可能是页内其他元素）
     let done = null;
     for (let i = 0; i < 15 && !done; i++) {
@@ -823,10 +916,19 @@ function parseArgs(argv) {
       });
     }
     console.log(verified ? '封面已用竖版自定义图落表单 ✓' : '警告：封面比例验证未通过，请人工核对截图');
+    if (verified) log.step('封面校验', '3:4 竖版自定义图已落表单');
+    else log.warn('封面比例验证未通过，请人工核对截图');
   }
   // 4) 截图，停「发送」前
   await p.screenshot({ path: SHOT });
   console.log('screenshot →', SHOT);
   console.log('STATUS: 已停在「发送」按钮前，等待用户点击发送（发送前请确认缩略图为视频模式）');
+  log.step('收尾', '停在「发送」按钮前');
+  log.finish('ok');
   process.exit(0);
-})().catch((e) => { console.error('FATAL', e.message); if (process.env.WB_DEBUG_STACK) console.error(e.stack); process.exit(1); });
+})().catch((e) => {
+  console.error('FATAL', e.message);
+  if (process.env.WB_DEBUG_STACK) console.error(e.stack);
+  if (log) { log.warn('FATAL ' + e.message); log.finish('failed'); }
+  process.exit(1);
+});

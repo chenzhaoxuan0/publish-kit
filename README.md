@@ -86,6 +86,93 @@ node bin/doctor.cjs      # ← 复核
 
 ---
 
+## 横向能力层
+
+各平台脚本只管「这个平台怎么填」，通用能力抽在 `lib/` 里。
+
+| 模块 | 做什么 | 为什么有它 |
+|---|---|---|
+| `lib/wait.cjs` | `waitFor` 条件等待 · `humanDelay` 随机节奏 · `fillLongText` 一次性长文本插入 · `pickFileWithRetry` 上传重试 | 以前每个平台各写各的 `sleep()` 和轮询循环，间隔还不统一（1500/2000/3000 都有）。**固定等待等不够就往下走 → 后续动作落空；等太久就是白等。** |
+| `lib/log.cjs` | 每平台一份独立日志：带时间戳每一步 + 收尾的**步骤耗时倒序表** + 告警汇总 | 慢在哪不该靠猜 |
+| `lib/preflight.cjs` | **起浏览器之前**的体检：图集张数 vs 实际、正文长度区间、违禁内容、标题长度 | 见下面「判据的前提」 |
+| `lib/ledger.cjs` | 可选发布台账 + **防重复发布闸门** | 「绝不重复发布」需要跨进程、跨期的事实源 |
+| `lib/publish-all.cjs` | 并行编排器：长任务优先调度 + 并发上限 | 见下面「并行」 |
+
+### 判据的前提是 count 本身对
+
+任何「上传后确认成功」的自动化，判据只能证明**页面上的东西**，证明不了**喂进去的东西**。
+
+真实事故：某平台的图集列表只列了 1 张 → count=1 → 三个平台各只传了 1 张图，
+而每个平台的判据都「通过」了（`渲染张数 ≥ count`，1 ≥ 1 恒成立）——
+脚本报成功、语气笃定，结果三个平台全是残缺图集。
+
+→ **起浏览器之前**先核对「声明要传几张」与「目录里真有几张」，不过就不执行。
+宁可不发，也不发错。
+
+### 并行
+
+```bash
+node bin/publish-all.cjs --platforms douyin,weibo,zhihu --kind image \
+     --media ./cards --count 8 --title "标题" --body-file body.txt
+```
+
+实测（8 图 + 视频素材，9 平台）：**串行 613.1s → 并行 120.7s 墙钟**。
+
+两条从实测里长出来的规则：
+
+1. **长任务优先调度** —— 按各平台实测耗时从大到小先发。否则并发有上限时，
+   墙钟 ≈「最慢的排最后」那个，而不是最慢平台本身的耗时。
+2. **默认并发上限 5** —— 9 全并发会触发**平台侧限流**：同账号并发上传时，
+   知乎的图集一直只上到 7 张（补传还会把重复图当成第 8 张 → 图集区只有 7 张）。
+   实测降到 5 反而更快（145.6s → 120.7s）且 9/9 成功。
+   要一把梭用 `--concurrency 99`（自己承担限流风险）。
+
+### 速度优化：长文本一次性插入
+
+逐字 `keyboard.type` 每敲一个字符都是一次 CDP 往返，N 个字符 = N 次往返。
+实测 958 字简介：逐块 type 要 12s，`insertText` 约 0.6s，**省约 11s**。
+
+⚠️ `insertText` **不保证触发编辑器的 input 事件** —— 有些编辑器（React 受控）
+会「看起来插进去了但 state 没收到」。所以 `fillLongText` 一律**回读校验**，
+对不上就**自动退回**逐块输入，不把半截正文交割出去。
+
+### 可选：防重复发布台账
+
+```yaml
+publish:
+  ledger: "./publish-ledger.yaml"    # 不配 = 零行为变化
+```
+
+配了之后，`node bin/publish-all.cjs --content-key "2026-10-21_xxx#video"` 会在
+**起浏览器之前**查台账：这条内容在某个平台已是 `manual-handoff`（已填完交给你、等你点发布）
+或 `published`（已发布）就**挡住**，除非显式 `--allow-repeat`。
+
+页面态护栏挡不住这些：昨天发过这一期、填完交给你还没点、上次失败重跑。
+
+---
+
+## 常用命令
+
+```bash
+# 单平台（原有用法不变）
+node platforms/douyin.cjs --kind image --media ./cards --count 8 --title "标题" --body-file body.txt
+node platforms/bilibili.cjs --video a.mp4 --title "标题" --body-file desc.txt --tags "AI,大模型" --cover c.png
+
+# 多平台并行（一条命令）
+node bin/publish-all.cjs --platforms douyin,weibo,zhihu --kind image \
+     --media ./cards --count 8 --title "标题" --body-file body.txt
+node bin/publish-all.cjs --platforms douyin,weibo,zhihu,bilibili,shipinhao --kind video \
+     --video a.mp4 --title "标题" --body-file desc.txt --cover c.png --concurrency 5
+
+# 自检（改完 lib/ 跑一次）
+node selftest.cjs
+```
+
+⚠️ `publish-all` **物料不全会秒级报错且不启动任何平台脚本** —— 它会并发起 N 个进程连你的浏览器，
+物料不全就别启动（否则白开 N 个标签页，还可能抢到你已填好的表单页）。
+
+---
+
 ## 快速开始
 
 ```bash
@@ -167,6 +254,66 @@ npx publish-kit doctor    # 等同 node bin/doctor.cjs
 npx publish-kit login 抖音 B站
 npx publish-kit platforms   # 列出所有脚本与用法
 ```
+
+---
+
+## 实测耗时
+
+2026-10-21/22 期真实素材实测（8 图 + 视频）。这些数字用来做**长任务优先调度**。
+
+| 平台 | 线 | 耗时 | 备注 |
+|---|---|---|---|
+| 微博图文 | image | 14s | 8 图 + 10 话题 + 声明 |
+| 知乎想法 | image | 27s | 8 图逐张 + 正文 1338 字回读 |
+| 抖音图文 | image | 68s | **必须逐张传**（批量多选不可靠）+ 收尾复核张数 |
+| 抖音视频 | video | 116s | 上传转码 + 双封面 + 合集 + 声明 |
+| 微博视频 | video | 40s | 含内容声明 + 3:4 封面 + 分类频道 |
+| 知乎视频 | video | 76s | 含视频标记 + 领域 + 封面 |
+| B站视频 | video | 69s | 10 标签 + 双比例封面 + canvas 终验 |
+| 视频号 | video | 42s | 含位置/合集/标注 |
+| 公众号 | image | ~5s | 走 API，不占浏览器 |
+| **9 平台并行** | — | **120.7s 墙钟** | 串行需 613.1s → **5.1×** |
+
+---
+
+## 两条运行通道（架构说明）
+
+目前平台脚本直接用 `patchright`（Playwright 兼容层）连一个外部 Chrome。
+
+这是一个**刻意的选择**：publish-kit 是给「想自己掌控浏览器的人」用的工具 ——
+登录态在自己的 profile 里，脚本不碰 profile、不注入指纹、不清 cookie。
+
+其他通道（比如把自动化跑在**受控的独立浏览器**里）也可以接，但它们各有取舍：
+
+| | 外部 Chrome（当前） | 受控独立浏览器 |
+|---|---|---|
+| 登录态 | 你的日常 profile | 独立空间，隔离更彻底 |
+| 依赖 | patchright（MIT） | 往往是闭源商业软件 |
+| 开源用户装得上 | ✅ | ❌ 通常要单独买/装 |
+| 风控特征 | 真实浏览器特征 | 视实现而定 |
+
+所以本项目的路线是：**核心平台逻辑（选择器、坑位、流程、算法）与运行通道解耦**，
+通道做成可替换的实现。已完成的解耦点：
+
+- `lib/wait.cjs` / `lib/log.cjs` / `lib/preflight.cjs` / `lib/ledger.cjs` —— **通道无关**
+- `lib/publish-all.cjs` —— 编排层，**通道无关**（它只 spawn 平台脚本）
+- 平台脚本里的 DOM 操作 —— 目前与 Playwright 绑定，是**下一步**要解耦的部分
+
+给贡献者的建议：**新加通道时，不要复制 `platforms/*.cjs`**。
+先问「这段逻辑是通道无关的平台知识（→ 放 `lib/`），还是通道相关的 DOM 操作（→ 放通道适配层）」。
+
+### 已有的另一条通道（参考实现）
+
+「把整套填单流程搬到另一条受控浏览器上跑」这个需求，已经有人做出来了 ——
+在 content 工作区里以 `04_skills/ego-publish/` 的形式存在（独立于本仓库，
+因为它还带了内容生产线的编排层）。
+
+它带来的**最大收获不是「多一条通道」，而是把凭手感的地方全变成了可判定的判据**：
+那些在原通道上「凑巧能跑」的写法，换条通道就暴露了 —— 假候选、零尺寸按钮、
+被破坏的 selection 状态、只信页面文字的计数判据……
+
+本仓库这一轮的内化（`docs/cability-matrix.md` 有完整对照）就是这么来的：
+**在一条通道上暴露的问题，修好了对所有通道都成立。**
 
 ---
 

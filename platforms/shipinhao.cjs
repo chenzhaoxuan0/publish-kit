@@ -52,10 +52,32 @@
 //   4) 2026-10-19 描述回读闭环：描述含 # 会触发话题联想，平台可能把词顶替成热榜话题
 //      （知乎同类编辑器已实证）。描述步改为「type → 回读比对 → 不一致就地清空重灌
 //      （insertText）→ 再回读」，仍不一致则抛错，**任何情况下都不重传视频**。
+//
+// ── 2026-10-22 内化（横向能力层接入）新增坑位 ────────────────────────
+//   ⑰ **上传区是 Ant Design 拖拽区，`<input type=file>` 是隐藏的**：
+//      直接往 input 塞文件**不触发 UI 上传逻辑**（文件不落表单）——老代码 setVideoFile
+//      直塞就是这条，所以「视频已提交」其实没提交。
+//      正确做法：找 input[type=file] 的**可见祖先**（实测视频是 span.ant-upload.ant-upload-btn，
+//      文案「上传时长8小时内…」；封面是 div.single-cover-uploader-wrap，文案「上传封面」），
+//      点它 → 浏览器弹**原生 filechooser** → 拦截 → 塞文件。
+//      ⚠ wujie 微前端：DOM 在 shadowRoot 里，body 恒空是正常架构 —— 定位要**递归进 shadowRoot**
+//        （同 lib/bigfile-upload.cjs 的 DEEP_WALK 写法）。
+//      ⚠ 大文件（>48MB）不能走 chooser.setFiles（驱动 50MB 上限）：仍走 lib/bigfile-upload.cjs
+//        的 CDP 原生直传（cdpSetFiles 走 shadow 深搜）—— 大文件通道不拆。
+//      ⚠ 兜底顺序：**先点可见祖先**（UI 上传逻辑只认这条），唤不起来才退回 setVideoFile。
+//   ⑱ **点上传入口后 filechooser 偶发唤不起来**：坐标与成功那轮完全一致，文件选择器
+//      就是不弹（微博 / 抖音图文 / 抖音视频三平台都踩过）→ 整条线中止。
+//      处置：lib/wait.cjs 的 pickFileWithRetry —— 最多点 3 次，每次**重新取入口坐标**。
+//   ⑲ **描述逐字 type 很慢**：逐字 type 每敲一个字符都是一次 CDP 往返，实测 958 字 ≈12s，
+//      insertText 一次性插入 ≈0.6s。处置：fillLongText（insertText + 回读校验 + 对不上退回逐块）。
+//      ⚠ 描述里的「#」会触发话题联想面板：insertText 不派发按键 → 面板不触发 → 话题词原样保留；
+//        但 fillLongText 的兜底逐块输入**会**触发，所以下面仍保留「回读不一致 → 就地清空重灌
+//        （insertText）→ 再回读 → 仍不一致就抛错」的原修复路径。
+//   ⑳ 体检（preflight）必须在 connectOverCDP **之前**；日志层是**旁路**，只多打不改原输出。
 const fs = require('fs');
 const path = require('path');
 const cfg = require('../lib/config.cjs');
-const { setVideoFile } = require('../lib/bigfile-upload.cjs');
+const { setVideoFile, cdpSetFiles, LIMIT: BIG_LIMIT } = require('../lib/bigfile-upload.cjs');
 
 let chromium;
 try {
@@ -65,7 +87,13 @@ try {
   process.exit(1);
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// 2026-10-22 内化：等待层（长文本一次性插入 / 上传入口重试）+ 日志层 + 起浏览器前体检
+const { sleep, fillLongText, pickFileWithRetry } = require('../lib/wait.cjs');
+const { create } = require('../lib/log.cjs');
+const { preflight } = require('../lib/preflight.cjs');
+
+// 每平台独立日志（旁路）。异常路径也要收尾，否则失败时反而没有留痕。
+let log = null;
 
 // 截图统一落 config.yaml 的 publish.screenshot_dir（默认 ./screenshots），目录不存在即建
 const SHOT = path.join(cfg.screenshotDir(), 'shipinhao.png');
@@ -90,6 +118,64 @@ const TITLE_ALLOWED = /^[\u4e00-\u9fffA-Za-z0-9\s：《》“”‘’：+？?%�
 function checkTitle(t) {
   if ([...t].length > 16) throw new Error('短标题 ' + [...t].length + ' 字超 16 字上限（' + t + '）——请给 ≤16 字短变体（如去「IPO」/压缩写法），不要复用 20 字款');
   if (!TITLE_ALLOWED.test(t)) throw new Error('短标题含平台不支持的特殊符号（' + t + '）——仅允许 中文/字母/数字/空格/书名号/引号/冒号/加号/问号/百分号/摄氏度；连字符（如 GPT-6）须写作 GPT6，逗号用空格替代');
+}
+
+// 2026-10-22（坑位⑰）：找 `<input type=file>` 的**可见祖先**（真正的上传入口）。
+//   为什么不能直接塞 input：视频号的上传区是 Ant Design 拖拽区，input 是隐藏的，
+//   直接塞**不触发 UI 上传逻辑**（文件不落表单）。
+//   为什么必须递归 shadowRoot：wujie 微前端的 DOM 在 shadowRoot 里，body 恒空是正常架构
+//   （同 lib/bigfile-upload.cjs 的 DEEP_WALK 写法）。
+//   可见祖先的判据（从下往上第一个命中）：类名像上传件（ant-upload / uploader）
+//   或文案命中提示词；都没有就取**最近的可见祖先**。
+//   命中多个候选时先按「可见弹窗优先」（封面编辑弹窗里的上传区才是当前要点的那一个）。
+function locateUploadTrigger(p, inputSel, hintRe, acceptRe) {
+  return p.evaluate(({ inputSel, hintSrc, acceptSrc }) => {
+    const hint = new RegExp(hintSrc);
+    const accept = acceptSrc ? new RegExp(acceptSrc) : null;
+    const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    // 页面内收集匹配选择器的元素，显式深走 shadowRoot（最多 12 层，同 bigfile-upload）
+    const deepQuery = (root, sel, depth) => {
+      const out = [];
+      if (depth > 12) return out;
+      try { for (const el of root.querySelectorAll(sel)) out.push(el); } catch (e) { /* 某些 scope 不支持 */ }
+      let all;
+      try { all = root.querySelectorAll('*'); } catch (e) { return out; }
+      for (const el of all) { if (el.shadowRoot) out.push(...deepQuery(el.shadowRoot, sel, depth + 1)); }
+      return out;
+    };
+    // 查找范围：**可见弹窗优先，然后才是整页**。
+    //   ⚠ 不能「有弹窗就只搜弹窗」：发表页上任何时候都可能有别的可见弹窗，
+    //     那样会把 shadowRoot 里的视频上传入口整个漏掉（实测踩到过）。
+    const dialogs = [...document.querySelectorAll('.weui-desktop-dialog__wrp')].filter(vis);
+    const scopes = [...dialogs, document];
+    for (const scope of scopes) {
+      const inputs = deepQuery(scope, inputSel, 0).filter((el) => !accept || accept.test(el.accept || ''));
+      for (const inp of inputs) {
+        let node = inp, picked = null;
+        for (let i = 0; i < 10 && node; i++) {
+          if (vis(node)) {
+            const cls = (node.className || '').toString();
+            const txt = (node.textContent || '').trim();
+            const clsHit = /ant-upload|uploader/.test(cls);
+            const txtHit = hint.test(txt) && txt.length < 80;
+            if (clsHit || txtHit) { picked = node; break; }
+            if (!picked) picked = node;   // 记下最近的可见祖先
+          }
+          node = node.parentElement;
+        }
+        if (picked) {
+          const r = picked.getBoundingClientRect();
+          return {
+            x: Math.round(r.x + r.width / 2),
+            y: Math.round(r.y + r.height / 2),
+            cls: (picked.className || '').toString().slice(0, 60),
+            txt: (picked.textContent || '').trim().slice(0, 40),
+          };
+        }
+      }
+    }
+    return null;
+  }, { inputSel, hintSrc: hintRe.source, acceptSrc: acceptRe ? acceptRe.source : '' });
 }
 
 (async () => {
@@ -168,6 +254,25 @@ function checkTitle(t) {
   // 视频号编辑器逐字输入时连续换行会渲染出空行（2026-09-22 经实测确定）：压成单换行
   const body = bodyRaw.replace(/\r\n/g, '\n').replace(/\n{2,}/g, '\n');
 
+  // 2026-10-22：每平台独立日志（旁路，只多打不改原有 console 输出）
+  log = create({ platform: 'shipinhao', kind: 'video' });
+
+  // 2026-10-22：起浏览器**之前**的体检（坑位⑳）。契约：不过就抛，别 catch 后继续。
+  if (oneShot) {
+    // 判据：①正文里的 undefined / NaN / [object Object] ②正文长度区间 ③短标题长度
+    // 短标题 ≤16 字是**硬约束**（本脚本 checkTitle 已经 throw，这里体检再兜一层）；
+    // 描述上限 1000 字（与抖音简介同口径：1000 顶格截断；2026-10-22 ego 通道实测 968 字通过）。
+    preflight({
+      platform: 'shipinhao',
+      title: args.title,
+      bodyText: body,
+      limits: { titleMax: 16, bodyMax: 1000, bodyMin: 1 },
+    });
+    log.step('起浏览器前体检', '短标题 ≤16 / 描述 ≤1000 + undefined 守卫');
+  } else {
+    log.step('起浏览器前体检', (openOnly ? 'open 模式' : (coverOnly ? 'cover 补投模式' : 'fix 修补模式')) + '，无正文，跳过');
+  }
+
   const browser = await chromium.connectOverCDP(CDP, { timeout: 15000 });
   const ctx = browser.contexts()[0];
   const p0 = ctx.pages().find((x) => /channels\.weixin\.qq\.com/.test(x.url()));
@@ -193,24 +298,53 @@ function checkTitle(t) {
   await p.locator('text=发表视频').first().click({ timeout: 10000 });
   await sleep(15000);
 
-  // 2) 上传视频（file input 在 wujie shadowRoot 内，playwright CSS 穿透 shadow DOM）
+  // 2) 上传视频（坑位⑰）：**先点可见祖先**（Ant Design 拖拽区）触发原生 filechooser，
+  //    唤不起来才退回 setVideoFile（原行为，含 wujie 重挂载竞态重试）。
+  //    file input 在 wujie shadowRoot 内，playwright CSS 穿透 shadow DOM；
   //    2026-09-29 加固：发表页改版为 /platform/post/create 后微应用挂载慢且会重挂，
   //    固定等待后 setInputFiles 连续撞 detached——对竞态类错误重试（重新定位，最多 3 轮）
   {
+    const videoFile = path.resolve(args.video);
+    const VIDEO_SEL = 'input[type=file][accept*="video"]';
     let upOk = false;
-    for (let round = 1; round <= 3 && !upOk; round++) {
-      try {
-        await setVideoFile(p, 'input[type=file][accept*="video"]', path.resolve(args.video));
-        upOk = true;
-      } catch (e) {
-        if (!/detached|Timeout.*exceeded/i.test(e.message || '')) throw e;
-        console.log('视频 input 未挂稳（wujie 重挂载竞态），重试 ' + round + '/3');
-        await sleep(8000);
+    // ① 首选：点可见祖先 → 原生 filechooser（UI 上传逻辑只认这条路径）
+    try {
+      const chooser = await pickFileWithRetry(
+        p,
+        () => locateUploadTrigger(p, VIDEO_SEL, /上传时长|上传视频|点击上传/, /video/),
+        { attempts: 3, timeout: 15000, step: 'shipinhao-video' }
+      );
+      const size = fs.statSync(videoFile).size;
+      if (size > BIG_LIMIT) {
+        // 大文件：chooser.setFiles 同样受驱动 50MB 上限 → 仍走 CDP 原生直传（大文件通道不拆）
+        await cdpSetFiles(p, VIDEO_SEL, 0, videoFile);
+        console.log(`视频 ${(size / 1048576).toFixed(1)}MB 超过 50MB 传输上限，已改走 CDP 原生直传（UI 流程已由点击可见祖先触发）: ${path.basename(videoFile)}`);
+      } else {
+        await chooser.setFiles(videoFile);
+        console.log('视频已提交（filechooser 拦截）:', path.basename(videoFile));
       }
+      upOk = true;
+    } catch (e) {
+      console.log('⚠ 点可见祖先未唤起文件选择器（' + e.message + '）→ 退回 setVideoFile');
+      log.warn('视频上传：可见祖先路径失败（' + e.message + '）→ 退回 setVideoFile');
     }
-    if (!upOk) throw new Error('视频 input 挂稳失败（wujie 微应用重挂载竞态 3 轮未过），请人工上传或稍后重跑');
+    // ② 兜底：setVideoFile（小文件 locator 直塞 / 大文件 CDP 直传）+ 竞态重试
+    if (!upOk) {
+      for (let round = 1; round <= 3 && !upOk; round++) {
+        try {
+          await setVideoFile(p, VIDEO_SEL, videoFile);
+          upOk = true;
+        } catch (e) {
+          if (!/detached|Timeout.*exceeded/i.test(e.message || '')) throw e;
+          console.log('视频 input 未挂稳（wujie 重挂载竞态），重试 ' + round + '/3');
+          await sleep(8000);
+        }
+      }
+      if (!upOk) throw new Error('视频 input 挂稳失败（wujie 微应用重挂载竞态 3 轮未过），请人工上传或稍后重跑');
+    }
   }
   console.log('视频已提交，等待上传转码与表单展开…');
+  log.step('上传视频', path.basename(args.video));
 
   // 3) 等描述编辑器出现（挂载完成标志）
   const editor = p.locator('div.input-editor').first();
@@ -232,8 +366,16 @@ function checkTitle(t) {
   const normDesc = (s) => (s || '').replace(/\u200b/g, '').replace(/\s+/g, '');
   await editor.click({ timeout: 8000 });
   await sleep(600);
-  await p.keyboard.type(body, { delay: 8 });
-  console.log('描述已填');
+  // 2026-10-22 内化提速（坑位⑲）：逐字 type → fillLongText
+  //   （insertText 一次性插入 + 回读校验 + 对不上自动退回逐块输入）。
+  //   ⚠ 描述里的「#」会触发话题联想面板（2026-10-19 实测）：insertText 不派发按键 →
+  //     面板不触发 → 话题词原样保留；但 fillLongText 的兜底逐块输入**会**触发面板，
+  //     所以下面仍保留「回读不一致 → 就地清空重灌（insertText）→ 再回读 → 仍不一致就抛错」
+  //     这条原修复路径（全程不重传视频）。
+  const readDescLen = async () => normDesc(await readDesc()).length;
+  const usedFast = await fillLongText(p, readDescLen, body, { step: 'shipinhao' });
+  console.log(usedFast ? '描述已填（一次性插入 + 回读校验通过）' : '描述已填（退回逐块输入）');
+  log.step('描述', usedFast ? 'insertText 一次性插入（回读通过）' : '退回逐块输入');
   await sleep(1200);
   await p.mouse.click(400, 400);
   await sleep(800);
@@ -258,6 +400,7 @@ function checkTitle(t) {
       + '，实际尾部 ' + JSON.stringify(normDesc(descNow).slice(-60)) + '）。请人工检查页面，勿直接发表。');
   }
   console.log('描述回读校验 ✓（与给定正文一致，未被平台改写）');
+  log.step('描述回读校验', '✓ 与给定正文一致，未被平台改写');
 
   } // end !coverOnly&&!fixMode（上传与描述步整体，cover/fix 模式直达后续段）
 
@@ -265,6 +408,7 @@ function checkTitle(t) {
   if (!coverOnly && !fixMode) {
     await p.locator('input[placeholder*="短标题"]').first().fill(args.title);
     console.log('短标题已填（' + [...args.title].length + ' 字）');
+    log.step('短标题', args.title + '（' + [...args.title].length + ' 字）');
   } else if (fixMode && args.title) {
     await p.locator('input[placeholder*="短标题"]').first().fill(args.title);
     console.log('短标题已重填（' + [...args.title].length + ' 字）');
@@ -282,11 +426,30 @@ function checkTitle(t) {
     await p.mouse.click(eb.x + eb.width / 2, eb.y + eb.height / 2);
     console.log('封面「编辑」已点');
     await sleep(3000);
-    // 5.5b) 弹窗「编辑封面」→ 图片 input（accept 含 image）直接 setInputFiles
-    const imgInput = p.locator('input[type=file][accept*="image"]').first();
-    await imgInput.waitFor({ state: 'attached', timeout: 15000 });
-    await imgInput.setInputFiles(coverFile);
+    // 5.5b) 弹窗「编辑封面」→ 图片 input（accept 含 image）
+    //     2026-10-22（坑位⑰）：同视频上传 —— 直接塞 input 不触发 UI 上传逻辑，
+    //     改成点 input 的**可见祖先**（实测 div.single-cover-uploader-wrap，文案「上传封面」）
+    //     触发原生 filechooser；唤不起来才退回 input 直塞（原行为）。
+    let coverSubmitted = false;
+    try {
+      const chooser = await pickFileWithRetry(
+        p,
+        () => locateUploadTrigger(p, 'input[type=file][accept*="image"]', /上传封面|上传图片/, /image/),
+        { attempts: 3, timeout: 12000, step: 'shipinhao-cover' }
+      );
+      await chooser.setFiles(coverFile);
+      coverSubmitted = true;
+    } catch (e) {
+      console.log('⚠ 封面可见祖先未唤起文件选择器（' + e.message + '）→ 退回 input 直塞');
+      log.warn('封面：可见祖先路径失败（' + e.message + '）→ 退回 input 直塞');
+    }
+    if (!coverSubmitted) {
+      const imgInput = p.locator('input[type=file][accept*="image"]').first();
+      await imgInput.waitFor({ state: 'attached', timeout: 15000 });
+      await imgInput.setInputFiles(coverFile);
+    }
     console.log('自定义封面已提交:', path.basename(coverFile));
+    log.step('自定义封面', path.basename(coverFile) + (coverSubmitted ? '（filechooser 拦截）' : '（input 直塞回退）'));
     // 5.5c) 轮询等「确认」出现再点——图片上传期间确认按钮不渲染（2026-09-22 实测约 10s 出现，
     //       固定短等待会误判弹窗已关导致后续合集/位置点击全落遮罩上）
     let okClicked = false;
@@ -430,6 +593,8 @@ function checkTitle(t) {
       return txt;
     });
     console.log(albumTxt && albumTxt.includes(albumName) ? '合集已加: ' + albumTxt + ' ✓' : '警告：合集状态异常（显示：' + albumTxt + '），请人工核对');
+    if (albumTxt && albumTxt.includes(albumName)) log.step('合集', albumName + '（回读✓）');
+    else log.warn('合集状态异常（显示：' + albumTxt + '）—— 请人工核对');
   } else console.log('合集：本次未设置（未传 --album，且 platforms.shipinhao.album 未配置）——发布前如需合集请手动选择');
 
   // 5.7) 位置（hide_location 为真 / --location off → 「不显示位置」；2026-09-22 经实测确定）
@@ -499,7 +664,7 @@ function checkTitle(t) {
         walk(document);
         return txt;
       });
-      if (cur === '不显示位置') { locSet = true; console.log('位置已设为不显示 ✓（回读验证）'); }
+      if (cur === '不显示位置') { locSet = true; console.log('位置已设为不显示 ✓（回读验证）'); log.step('位置', '不显示位置（回读✓）'); }
       else locDiag = '点击未生效（回读: ' + JSON.stringify(cur) + '）';
     }
     if (!locSet) console.log('警告：位置未设为不显示（' + locDiag + '）——发布前请手动点位置行选「不显示位置」');
@@ -648,11 +813,20 @@ function checkTitle(t) {
       return txt;
     });
     console.log(done === '含AI生成内容' ? '视频标注：含AI生成内容 ✓' : '警告：视频标注状态异常（显示：' + done + '），请人工核对');
+    if (done === '含AI生成内容') log.step('视频标注', '含AI生成内容（回读✓）');
+    else log.warn('视频标注状态异常（显示：' + done + '）—— 请人工核对');
   }
 
   // 6) 截图，停「发表」前（合集/位置/视频标注等其余表单由人工核对；封面已 --cover 自动化）
   await p.screenshot({ path: SHOT });
   console.log('screenshot →', SHOT);
   console.log('STATUS: 已停在「发表」按钮前，等待用户点击发表');
+  log.step('已停在「发表」前', SHOT);
+  log.finish('ok');
   process.exit(0);
-})().catch((e) => { console.error('FATAL', e.message); process.exit(1); });
+})().catch((e) => {
+  console.error('FATAL', e.message);
+  // 异常路径也要把日志收尾（耗时表 + 告警汇总），否则失败时反而没有留痕
+  if (log) { try { log.finish('failed'); } catch (_) { /* 收尾失败不影响主流程 */ } }
+  process.exit(1);
+});
