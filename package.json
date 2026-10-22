@@ -25,6 +25,18 @@
   ],
   "license": "MIT",
   "type": "commonjs",
+  "files": [
+    "bin/",
+    "lib/",
+    "platforms/",
+    "skills/",
+    "docs/",
+    "config.example.yaml",
+    "AGENTS.md",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
   "dependencies": {
     "patchright": "^1.62.3",
     "yaml": "^2.4.0"

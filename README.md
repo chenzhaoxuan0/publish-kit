@@ -32,6 +32,44 @@ node bin/doctor.cjs      # ← 复核
 
 ---
 
+## 🤖 Agent skill
+
+仓库里带了一个可直接安装的 skill，让 AI agent 按**正确顺序**调用本工具：
+
+```
+skills/publish-kit/
+├── SKILL.md                      决策流程 + 红线 + 命令速查
+├── references/
+│   ├── commands.md               完整命令面（每平台参数 / 用法 / 坑位）
+│   └── troubleshooting.md        排障详表
+└── INSTALL.md                    安装说明
+```
+
+装法（详见 `skills/publish-kit/INSTALL.md`）：
+
+```bash
+# 从仓库
+git clone https://github.com/chenzhaoxuan0/publish-kit.git && cd publish-kit && npm install
+cp -r skills/publish-kit ~/.minimax/agents/mavis/skills/    # mavis
+# 或 ~/.claude/skills/ 等你的 agent 的 skills 目录
+
+# 从 npm
+npm install -g publish-kit
+cp -r "$(npm root -g)/publish-kit/skills/publish-kit" ~/.minimax/agents/mavis/skills/
+```
+
+skill 的价值不在「教会模型敲命令」，而在**固化三条容易被忽略的东西**：
+
+1. **红线** —— 绝不点发布、绝不自动登录、绝不替用户猜分区/合集
+2. **顺序** —— 先 `doctor` 查登录态再填单；重跑前先看交割护栏（别急着加 `--force`）
+3. **判据** —— 平台改版时的排查路径（先读脚本头坑位注释，再写探针抓地面真相，
+   别靠反复实跑试探）
+
+> 它和 [`AGENTS.md`](AGENTS.md) 是同一套知识的两种形态：
+> `AGENTS.md` 给人读（更全），skill 给 agent 读（更聚焦「怎么用」）。
+
+---
+
 ## ⚠️ 先读这一段：这是个参考实现，不是开箱即用的库
 
 请在决定用之前先接受下面三点，否则你会在第二次运行时放弃：
