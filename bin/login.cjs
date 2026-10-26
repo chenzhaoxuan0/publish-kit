@@ -9,6 +9,7 @@
 //   node bin/login.cjs --all          打开所有已启用的平台
 const cfg = require('../lib/config.cjs');
 const platforms = require('../lib/platforms.cjs');
+const driver = require('../lib/driver.cjs');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -61,6 +62,18 @@ async function main() {
     console.log(`${C.dim}· ${p.label}：走官方 API，不需要浏览器登录。请确认 config.yaml 里 app_id / app_secret 已填。${C.reset}`);
   }
   if (!browserTargets.length) return;
+
+  // ── ego 通道：登录发生在 ego lite 窗口里，本命令（普通 node 进程）帮不上忙 ──
+  if (driver.configuredChannel() === 'ego') {
+    console.log(`\n${C.bold}ego 通道的登录方式${C.reset}`);
+    console.log(`  登录态在 ego lite 自己的 profile 里（所有 TaskSpace 共享）。`);
+    console.log(`  请打开 ego lite 窗口，直接访问以下平台完成登录（本命令不代点任何按钮）：`);
+    for (const k of browserTargets) {
+      console.log(`    · ${platforms.get(k).label}  ${C.dim}${platforms.get(k).url}${C.reset}`);
+    }
+    console.log(`${C.dim}登录完成后重跑：node bin/doctor.cjs 复核${C.reset}\n`);
+    return;
+  }
 
   let chromium;
   try {

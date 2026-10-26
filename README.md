@@ -239,6 +239,34 @@ node bin/publish-all.cjs --platforms douyin,weibo,zhihu --kind image \
    实测降到 5 反而更快（145.6s → 120.7s）且 9/9 成功。
    要一把梭用 `--concurrency 99`（自己承担限流风险）。
 
+### 运行通道：CDP Chrome（playwright）与 ego lite（ego）
+
+同一份平台知识可以跑在两条通道上，由 `config.yaml` 的 `runtime.driver` 选择：
+
+| | `playwright`（默认） | `ego` |
+|---|---|---|
+| 浏览器 | 外部 CDP Chrome（`runtime.cdp_url`，patchright 附加） | ego lite 应用（ego-browser 运行时） |
+| 登录态 | CDP Chrome 的专用 profile | ego lite 自己的 profile（窗口里登录，所有空间共享） |
+| 并行模型 | 一个 Chrome 多标签页 | 每平台一个独立 TaskSpace（隔离更彻底） |
+| 启动方式 | `node platforms/…` / `node bin/publish-all.cjs` | 同一条命令 —— 编排器检测到 `driver: ego` 会自动改经 `bin/ego-run.ps1` 启动 |
+
+启用 ego 通道：`config.yaml` 里 `runtime.driver: "ego"`（前提：已安装 ego lite 并完成 onboarding）。
+`node bin/doctor.cjs` 会自动切换成 ego 体检项（找 ego-browser、报空间前缀）。
+
+ego 通道的三条专有约定：
+
+1. **TaskSpace 空间名 = `<前缀>-<平台>-<线>-<内容key>`**，前缀默认 `pk`（`runtime.space_prefix`）。
+   空间名在 ego 应用里**全局唯一** —— publish-kit 用 `pk` 与 operation 工作区的 `op` 隔离，
+   两边才能同时并行发布。一期一个空间：填完 `handOff()` 交还用户后，agent 接管不了旧空间。
+2. **只有序列最后一条命令交还用户**。编排器会自动给最后一条命令注入 `--handoff 1`；
+   中间命令交还 = 后续命令撞墙（handOff 之后 agent 不能自行接管，这是 ego 的 hard stop）。
+3. **>48MB 大文件不走 ego**：ego 的 filechooser 大文件路径未实测，脚本会明确报错转人工
+   （改回 playwright 通道或人工接管上传），绝不硬闯。
+
+⚠️ 本仓库不替你安装 ego lite，也不 import 它的 SDK —— 脚本经 `bin/ego-run.ps1`
+（ego-browser `nodejs -e` 动态 import + 参数注入）运行，通道差异全部收在
+`lib/driver.cjs` + `lib/drivers/ego.cjs` 门面里，平台脚本一份代码两通道通用。
+
 ### 速度优化：长文本一次性插入
 
 逐字 `keyboard.type` 每敲一个字符都是一次 CDP 往返，N 个字符 = N 次往返。

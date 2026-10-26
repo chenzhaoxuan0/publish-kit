@@ -14,6 +14,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const cfg = require('../lib/config.cjs');
 const platforms = require('../lib/platforms.cjs');
+const driver = require('../lib/driver.cjs');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -87,6 +88,34 @@ function launchChrome(chromePath, profileDir, port) {
   }
 }
 
+/** ego-browser 探测（与 bin/ego-run.ps1 的解析顺序一致：PATH → 安装目录） */
+function detectEgoBrowser() {
+  const { spawnSync } = require('child_process');
+  try {
+    const r = spawnSync('where.exe', ['ego-browser'], { encoding: 'utf8', timeout: 5000 });
+    if (r.status === 0 && r.stdout) {
+      const hit = r.stdout.split(/\r?\n/).find((l) => l.trim() && /ego/i.test(l));
+      if (hit && fs.existsSync(hit.trim())) return hit.trim();
+    }
+  } catch (_) { /* where 不存在就算了 */ }
+  const bases = [process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.LOCALAPPDATA].filter(Boolean);
+  for (const base of bases) {
+    for (const sub of ['Citro Labs\\ego lite\\Application', 'Programs\\Citro Labs\\ego lite\\Application']) {
+      const root = path.join(base, sub);
+      if (!fs.existsSync(root)) continue;
+      let best = null;
+      try {
+        for (const ver of fs.readdirSync(root)) {
+          const hit = path.join(root, ver, 'ego-browser.exe');
+          if (fs.existsSync(hit)) best = hit; // 目录名即版本号，readdirSync 顺序即可
+        }
+      } catch (_) { /* 读不了就算了 */ }
+      if (best) return best;
+    }
+  }
+  return '';
+}
+
 async function main() {
   console.log(`\n${C.bold}publish-kit 环境体检${C.reset}`);
   console.log('─'.repeat(60));
@@ -103,11 +132,44 @@ async function main() {
   const conf = cfg.load();
   console.log(ok(`config.yaml  ${C.dim}${path.relative(process.cwd(), conf.path)}${C.reset}`));
   console.log(`      内容领域：${cfg.contentDomain() || C.yellow + '(未填)' + C.reset}`);
+  const channel = driver.configuredChannel();
+  console.log(
+    `      运行通道：${
+      channel === 'ego'
+        ? `${C.cyan}ego lite（脚本经 bin/ego-run.ps1 跑在 ego-browser 运行时）${C.reset}`
+        : 'playwright + CDP Chrome'
+    }`
+  );
 
   // 1. Node
   const major = Number(process.versions.node.split('.')[0]);
   if (major < 18) { console.log(bad(`Node ${process.versions.node} 过低，需 >= 18`)); problems.push('node'); }
   else console.log(ok(`Node ${process.versions.node}`));
+
+  // ── ego 通道：体检项完全不同（不碰 patchright / Chrome / CDP / profile）──
+  if (channel === 'ego') {
+    const ego = detectEgoBrowser();
+    if (ego) {
+      console.log(ok(`ego-browser 已找到 ${C.dim}${ego}${C.reset}`));
+      tips.push('ego lite 每天自动升级，CLI 与 GUI 版本可能错配 —— 报 "Failed to connect to ego_cli" 时重启 ego lite 再试');
+    } else {
+      console.log(bad('未找到 ego-browser —— ego lite 需要先安装并完成 onboarding（https://lite.ego.app/）'));
+      problems.push('ego-browser');
+    }
+    const prefix = driver.spacePrefix();
+    console.log(ok(`TaskSpace 空间前缀 ${C.dim}${prefix}${C.reset}（与 operation 的 op 前缀隔离）`));
+    console.log(`\n${C.dim}ego 通道的登录态在 ego lite 自己的 profile 里 —— 在 ego lite 窗口里登录即可，`);
+    console.log(`本命令不做逐平台登录态检查。干跑运行器：pwsh -NoProfile -File bin/ego-run.ps1 -WhatIfOnly ...${C.reset}`);
+    console.log('\n' + '─'.repeat(60));
+    if (!problems.length) console.log(`${C.green}${C.bold}环境就绪。${C.reset}`);
+    else console.log(`${C.red}${C.bold}有 ${problems.length} 项待处理：${problems.join(', ')}${C.reset}`);
+    if (tips.length) {
+      console.log(`\n${C.bold}提示${C.reset}`);
+      tips.forEach((t) => console.log(`  · ${t}`));
+    }
+    console.log('');
+    return;
+  }
 
   // 2. 依赖
   let chromium = null;

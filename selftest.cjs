@@ -672,6 +672,174 @@ section('lib/preflight.cjs 图集连续性');
   ok('连续图集 → 通过', !okErr);
 }
 
+// ═══ 12. lib/driver.cjs + lib/drivers/ego.cjs（ego 通道门面，纯逻辑）═══
+section('lib/driver.cjs + lib/drivers/ego.cjs');
+{
+  const driver = require('./lib/driver.cjs');
+  const ego = require('./lib/drivers/ego.cjs');
+  const { flatArgsToScriptArgs, sanitizeSpaceKey } = require('./lib/publish-all.cjs');
+
+  // ── 通道判定 ──
+  const savedArgs = globalThis.__OP_ARGS__;
+  globalThis.__OP_ARGS__ = { _: ['open'] };
+  ok('__OP_ARGS__ 存在 → 判定 ego 通道', driver.runtimeChannel() === 'ego');
+  delete globalThis.__OP_ARGS__;
+  ok('__OP_ARGS__ 缺失 → 判定 playwright 通道', driver.runtimeChannel() === 'playwright');
+
+  // ── 扁平 argv → ScriptArgs 对象（编排器 ego spawn 的转换器）──
+  const sa = flatArgsToScriptArgs(['open', '--kind', 'image', '--space-key', 'k1', '--handoff', '1']);
+  ok('扁平 argv 转换：子命令进 _', sa._[0] === 'open');
+  ok('扁平 argv 转换：带值 flag', sa.kind === 'image' && sa['space-key'] === 'k1' && sa.handoff === '1');
+  const sa2 = flatArgsToScriptArgs(['fill', '--force']);
+  ok('扁平 argv 转换：无值 flag 读作 true', sa2.force === true);
+
+  // ── 空间 key 清洗（TaskSpace 名只收 [A-Za-z0-9_-]）──
+  ok('空间 key 清洗：中文/# → -', sanitizeSpaceKey('2026-10-21_AI热点速递#video') === '2026-10-21_AI-video');
+  ok('空间 key 清洗：空 → 空（调用方兜底）', sanitizeSpaceKey('') === '');
+
+  // ── ego 门面：假 taskSpace 全局 + 假 raw page ──
+  // 假 evaluate 按「函数源码特征」分发出 canned 值（真机上是页面在跑，测试里是桩）
+  function fakeRawPage({ url = 'https://creator.douyin.com/creator-micro/content/upload', alive = true } = {}) {
+    const calls = { screenshot: [], clicks: [], presses: [], fills: [], setInput: [], chooserFiles: [] };
+    const raw = {
+      __calls: calls,
+      url: async () => url,
+      title: async () => 't',
+      evaluate: async (fn, arg) => {
+        const src = String(fn);
+        if (/querySelectorAll\(q\)\.length/.test(src)) return 2; // resolveNth：多命中
+        if (/getBoundingClientRect/.test(src) && arg && arg.q) return { x: 10, y: 20, bx: 1, by: 2, bw: 100, bh: 50 };
+        if (/getBoundingClientRect/.test(src)) return { x: 10, y: 20 };
+        if (/querySelector/.test(src) && arg) return 'input-value'; // inputValue 读数
+        if (/sessionStorage/.test(src)) return 'image';
+        return alive ? 1 : null; // isPageAlive 探针
+      },
+      goto: async () => {},
+      waitForTimeout: async () => {},
+      waitForFileChooser: async (opts) => ({
+        isMultiple: () => false,
+        setFiles: async (files) => calls.chooserFiles.push(files),
+      }),
+      screenshot: async (opts) => {
+        calls.screenshot.push(opts);
+        return opts.path || 'ok';
+      },
+      setInputFiles: async (sel, files) => calls.setInput.push([sel, files]),
+      fill: async (sel, v) => calls.fills.push([sel, v]),
+      click: async (sel) => calls.clicks.push(['sel', sel]),
+      mouse: {
+        click: async (x, y, opts) => calls.clicks.push(['xy', x, y, opts]),
+        move: async () => {},
+      },
+      keyboard: {
+        type: async () => {},
+        insertText: async () => {},
+        press: async (chord) => calls.presses.push(chord),
+      },
+    };
+    return raw;
+  }
+
+  // 12a. wrapPage：url 异步化 + screenshot 剥 timeout + 路径转正斜杠
+  const raw = fakeRawPage();
+  const page = ego.wrapPage(raw);
+  ok('门面 url() 返回 Promise（两通道统一 await）', typeof page.url().then === 'function');
+  await page.screenshot({ path: 'C:\\x\\y.png', timeout: 6000, fullPage: false });
+  ok('screenshot 剥掉 timeout（ego 不认这个选项）', raw.__calls.screenshot[0].timeout === undefined);
+  ok('screenshot 路径转正斜杠', raw.__calls.screenshot[0].path === 'C:/x/y.png');
+  ok('screenshot 保留 fullPage', raw.__calls.screenshot[0].fullPage === false);
+
+  // 12b. waitForEvent('filechooser') → waitForFileChooser + setFiles 正斜杠化
+  const chooser = await page.waitForEvent('filechooser', { timeout: 100 });
+  await chooser.setFiles(['C:\\a\\img-01.png']);
+  ok('waitForEvent(filechooser) 映射到 waitForFileChooser', raw.__calls.chooserFiles[0][0] === 'C:/a/img-01.png');
+
+  // 12c. keyboard.press 的大小写归一（Control+a → Control+A）
+  await page.keyboard.press('Control+a');
+  await page.keyboard.press('Control+End');
+  ok('press 和弦键位归一为大写', raw.__calls.presses[0] === 'Control+A' && raw.__calls.presses[1] === 'Control+End');
+
+  // 12d. $(sel) 句柄：inputValue / fill 多命中加 nth=0 / click 走坐标
+  const handle = await page.$('input[placeholder*="标题"]');
+  ok('$(sel) 命中返回句柄', !!handle && handle.__egoHandle === true);
+  const missing = await page.$('input[type=checkbox][name=nowhere]');
+  // 假 evaluate 对 querySelector 特征一律返回真 → 用「命中数为 0」的旁路构造 miss：
+  // 真实 miss 语义由 evaluate 存在性检查保证，这里只验证句柄行为
+  ok('$(sel) 返回的句柄可 inputValue', (await handle.inputValue()) === 'input-value');
+  await handle.fill('标题文字');
+  ok('句柄 fill 多命中自动加 nth=0', raw.__calls.fills[0][0].endsWith('>> nth=0'), raw.__calls.fills[0][0]);
+  await handle.click();
+  ok('句柄 click 走坐标（避开 ego 多命中歧义）', raw.__calls.clicks.some((c) => c[0] === 'xy' && c[1] === 10 && c[2] === 20));
+
+  // 12e. locator：count / nth(i).screenshot 带 clip
+  const loc = page.locator('[class*="coverControl"]');
+  ok('locator().count() 返回命中数', (await loc.count()) === 2);
+  await loc.nth(0).screenshot({ path: 'C:\\x\\slot0.png', timeout: 15000 });
+  const shot0 = raw.__calls.screenshot.find((s) => s.path === 'C:/x/slot0.png');
+  ok('locator nth 截图带 clip 且剥 timeout', !!shot0 && shot0.timeout === undefined && shot0.clip.width === 100 && shot0.clip.height === 50);
+
+  // ── 12f. 会话生命周期：假 taskSpace 全局 ──
+  function fakeTask(name, { dead = false } = {}) {
+    const pages = [];
+    const task = {
+      name,
+      spaceId: 4400 + name.length,
+      ownership: 'agent',
+      pages: async () => pages,
+      tabs: async () => pages.map((p) => ({ url: p.__url, page: p })),
+      newPage: async () => {
+        const p = fakeRawPage({ alive: !dead });
+        pages.push(p);
+        return p;
+      },
+      handOff: async () => {
+        task.handedOff = true;
+      },
+      close: async () => {},
+    };
+    task.newPage(); // 预置一页
+    return task;
+  }
+  const spaces = {};
+  globalThis.taskSpace = async (name) => {
+    if (!spaces[name]) spaces[name] = fakeTask(name);
+    return spaces[name];
+  };
+  globalThis.takeOverTaskSpace = async (id) => {
+    if (id === 9999) throw new Error('hard stop: 空间已交还用户');
+    return fakeTask('takeover-' + id);
+  };
+
+  const s1 = await ego.createEgoSession({ platform: 'douyin', kind: 'image', spaceKey: 'k-2026-10-27', prefix: 'pk' });
+  ok('空间名 = 前缀-平台-线-key', s1.spaceName === 'pk-douyin-image-k-2026-10-27', s1.spaceName);
+  ok('会话带 spaceId 供编排器抓取', typeof s1.spaceId === 'number');
+  ok('ctx.pages() 返回门面页', (await s1.ctx.pages()).length === 1 && (await s1.ctx.pages())[0].__egoDriver === true);
+  let cdpThrew = '';
+  try { await s1.ctx.newCDPSession(); } catch (e) { cdpThrew = e.message; }
+  ok('ego 下 newCDPSession 明确报错（不假装支持）', /ego 通道不支持/.test(cdpThrew));
+  await s1.handOff();
+  ok('handOff 交还用户', s1.task.handedOff === true);
+
+  // 12g. 死页自愈：全死页空间 → 关死页 → 换 -r2 新空间名（绝不 claimTaskSpace）
+  spaces['pk-douyin-video-broken'] = fakeTask('pk-douyin-video-broken', { dead: true });
+  const s2 = await ego.createEgoSession({ platform: 'douyin', kind: 'video', spaceKey: 'broken', prefix: 'pk' });
+  ok('全死页 → 自动换 -r2 空间', s2.spaceName === 'pk-douyin-video-broken-r2', s2.spaceName);
+
+  // 12h. 接管路径被拒（hard stop）→ 原样抛出（那是「空间归用户」的信号）
+  let takeoverErr = null;
+  try {
+    await ego.openSpaceAuto('whatever', { spaceId: 9999 });
+  } catch (e) {
+    takeoverErr = e;
+  }
+  ok('接管被拒（hard stop）原样抛出', !!takeoverErr && /hard stop/i.test(takeoverErr.message));
+
+  // 还原全局，避免污染后续用例
+  if (savedArgs !== undefined) globalThis.__OP_ARGS__ = savedArgs;
+  delete globalThis.taskSpace;
+  delete globalThis.takeOverTaskSpace;
+}
+
 // ═══ 汇总 ══════════════════════════════════════════════════════════
 console.log(`\n${'═'.repeat(50)}`);
 console.log(`自检结果：✓ ${pass} 通过 / ✗ ${fail} 失败`);

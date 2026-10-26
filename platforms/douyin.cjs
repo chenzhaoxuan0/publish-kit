@@ -25,13 +25,22 @@
 //       截图存档（publish.screenshot_dir 下 douyin-image.png / douyin-video.png）。
 //
 // ── 依赖处理方式 ────────────────────────────────────────────────────
-//   1) patchright：走本包 node_modules（require('patchright')），未安装时本脚本直接报错退出，
-//      并提示 npm install；不引用包外的任何绝对路径。
-//   2) 浏览器：connectOverCDP 连一个已用 --remote-debugging-port 启动的 Chrome，
-//      地址取 config.yaml 的 runtime.cdp_url（也可用环境变量 CDP_URL 临时覆盖）。
-//      登录态由那个 Chrome profile 负责，本脚本不碰、不创建、不迁移任何浏览器 profile。
+//   1) 运行通道（2026-10-27 起，lib/driver.cjs）：
+//      · playwright（默认）：patchright 经 connectOverCDP 连外部 CDP Chrome，
+//        地址取 config.yaml 的 runtime.cdp_url（也可用环境变量 CDP_URL 临时覆盖）。
+//        patchright **惰性加载**（ego 通道绝不 import 它）。
+//      · ego：本脚本被 bin/ego-run.ps1 动态 import 进 ego-browser 运行时
+//        （globalThis.__OP_ARGS__ 注入参数），页面操作走 lib/drivers/ego.cjs 的
+//        Playwright 形状门面。登录态在 ego lite 自己的 profile 里。
+//      两条通道共用下面全部平台知识；通道差异只许出现在 lib/driver 层。
+//   2) 登录态由浏览器 profile 负责，本脚本不碰、不创建、不迁移任何浏览器 profile。
 //   3) lib/config.cjs：所有「业务默认值」的唯一来源。留空 = 跳过该字段 + 控制台告警，
 //      脚本永远不猜一个值替你填上（见 lib/config.cjs 顶部的契约说明）。
+//
+// ── ego 通道专有参数（经 ego-run.ps1 的 ScriptArgs 传入，编排器自动注入）──
+//   space-key  TaskSpace 空间标识（同一内容的多命令序列共享一个空间续上下文）
+//   handoff    序列最后一条命令置 1：填完交还用户（handOff）——
+//              ⚠️ 中间命令**不要**传：handOff 之后 agent 接管不了，后续命令会撞墙。
 //
 // ── 契约（最重要的一条）──────────────────────────────────────────────
 //   本脚本只做填单，绝不点击「发布」，发布由用户本人完成。
@@ -70,14 +79,10 @@ const cfg = require('../lib/config.cjs');
 const { setVideoFile } = require('../lib/bigfile-upload.cjs');
 // 2026-10-26 内化：截图留档层——截图失败只告警，不参与成败判据
 const { shot } = require('../lib/shot.cjs');
-
-let chromium;
-try {
-  chromium = require('patchright').chromium;
-} catch {
-  console.error('\n✗ patchright 未安装。在 publish-kit 目录下跑：npm install\n');
-  process.exit(1);
-}
+// 等待原语（sleep 此前在 upload/cover 路径被裸调但从未定义 —— 2026-10-27 修复的存量 bug）
+const { sleep } = require('../lib/wait.cjs');
+// 运行通道工厂：playwright（默认）| ego —— 通道差异全部收在这里
+const drv = require('../lib/driver.cjs');
 
 const UPLOAD_URL = 'https://creator.douyin.com/creator-micro/content/upload';
 
@@ -310,8 +315,10 @@ async function selectMusic(page, name, tab = '收藏') {
 // 判别一个标签页属于哪个 kind：URL 精确特征优先，其次读 open 时写入的 dyKind 标。
 // 2026-09-28 修复：dyKind 是 sessionStorage 标，同 tab 导航（如发布后跳 content/manage）不会清掉，
 // 曾把 manage 列表页误判成 image 表单页导致 open 跳过导航——现仅 /content/upload 表单页允许用标判别
+// ⚠️ 2026-10-27：`await page.url()` —— ego 门面的 url() 是异步的；
+//    playwright 的同步字符串被 await 是无操作，一行改动两通道通用。
 async function kindOf(page) {
-  const url = page.url();
+  const url = await page.url();
   if (/creator-micro\/content\/post\/video/.test(url)) return 'video';
   if (/creator-micro\/content\/post\/image/.test(url)) return 'image';
   if (/creator-micro\/content\/upload/.test(url)) {
@@ -321,7 +328,12 @@ async function kindOf(page) {
 }
 
 (async () => {
-  const args = parseArgs(process.argv.slice(2));
+  // 参数来源双通道：ego 运行时（ego-run.ps1 wrapper 注入 __OP_ARGS__）| 普通 node（CLI argv）
+  const args = globalThis.__OP_ARGS__ || parseArgs(process.argv.slice(2));
+  // --force 的三种到达形态：CLI 裸开关 / argv 里的字符串 / ScriptArgs 布尔
+  const FORCE =
+    process.argv.includes('--force') ||
+    (args.force !== undefined && args.force !== false && args.force !== 'false');
   const cmd = args._[0] || 'open';
   const kind = args.kind || 'image';
   if (kind !== 'image' && kind !== 'video') throw new Error('未知 --kind: ' + kind + '（可选 image|video）');
@@ -349,28 +361,38 @@ async function kindOf(page) {
     });
     if (pre.warn && pre.warn.length) console.warn(`[preflight:douyin] ${pre.warn.length} 条提醒`);
   }
-  const browser = await chromium.connectOverCDP(process.env.CDP_URL || cfg.cdpUrl(), { timeout: 15000 });
-  const ctx = browser.contexts()[0];
+  // ── 通道无关的会话开启（lib/driver.cjs）────────────────────────────
+  //   playwright：connectOverCDP 后返回真实 ctx；ego：开/恢复 TaskSpace 后返回门面 ctx。
+  //   spaceKey（ego 专用）：同一内容的多命令序列（open→upload→fill→…）共享一个
+  //   TaskSpace 续上下文；playwright 通道忽略它（多 tab 契约不变）。
+  const session = await drv.openSession({
+    platform: 'douyin',
+    kind,
+    spaceKey: String(args['space-key'] || args.space_key || ''),
+  });
+  const ctx = session.ctx;
 
+  // ⚠️ `await ctx.pages()`：ego 门面是异步（且只返回活页）；playwright 返回数组，
+  //    await 数组是无操作 —— 一行改动两通道通用。
   let page = null;
-  for (const cand of ctx.pages()) {
+  for (const cand of await ctx.pages()) {
     if ((await kindOf(cand)) === kind) { page = cand; break; }
   }
 
   if (cmd === 'open') {
     if (page) {
-      console.log('已存在 ' + kind + ' 表单页，跳过导航以保护已填内容: ' + page.url().slice(0, 90));
+      console.log('已存在 ' + kind + ' 表单页，跳过导航以保护已填内容: ' + (await page.url()).slice(0, 90));
     } else {
       page = await ctx.newPage();
       await page.goto(UPLOAD_URL, { timeout: 45000, waitUntil: 'domcontentloaded' }).catch(() => {});
       await page.waitForTimeout(6000);
       try {
-        const session = await ctx.newCDPSession(page);
-        const { windowId } = await session.send('Browser.getWindowForTarget');
+        const cdpSess = await ctx.newCDPSession(page);
+        const { windowId } = await cdpSess.send('Browser.getWindowForTarget');
         // 2026-09-28：弃用 maximize——最大化后渲染面可能不同步（页面缩成一角、截图超时、元素点击
         // 全部落空），固定 normal + 1600×1000 强制重设渲染面
-        await session.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } });
-        await session.send('Browser.setWindowBounds', { windowId, bounds: { left: 0, top: 0, width: 1600, height: 1000 } });
+        await cdpSess.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } });
+        await cdpSess.send('Browser.setWindowBounds', { windowId, bounds: { left: 0, top: 0, width: 1600, height: 1000 } });
         await page.waitForTimeout(1000);
       } catch (e) { console.warn('window size skip:', e.message); }
       if (kind === 'image') {
@@ -521,7 +543,7 @@ async function kindOf(page) {
     if (title) {
       // 交割护栏：标题已填（疑似已交割给用户）即拒绝重填
       const cur = await title.inputValue().catch(() => '');
-      if (cur.trim() && !process.argv.includes('--force')) throw new Error('[交割护栏] 抖音' + (kind === 'video' ? '视频' : '图文') + '表单已填写（疑似已交割给用户），拒绝重复填单。确认需重填：加 --force 重跑。');
+      if (cur.trim() && !FORCE) throw new Error('[交割护栏] 抖音' + (kind === 'video' ? '视频' : '图文') + '表单已填写（疑似已交割给用户），拒绝重复填单。确认需重填：加 --force 重跑。');
       await title.fill(args.title); console.log('标题已填');
     }
     else console.warn('未找到独立标题框，标题并入描述首行');
@@ -533,7 +555,7 @@ async function kindOf(page) {
     if (!editor) throw new Error('未找到描述编辑器');
     // 2026-09-28：「发文助手」浮窗（转码完成后弹出）会拦截编辑器点击——先整体隐藏
     await page.evaluate(() => document.querySelectorAll('[class*="creator-help"]').forEach((el) => { el.style.display = 'none'; }));
-    if (process.argv.includes('--force')) {
+    if (FORCE) {
       // --force 重填前清空编辑器（keyboard.type 是追加式，不清空会叠成超长/混入旧文；09-24/09-28 两度踩）
       await editor.click().catch(() => {});
       await page.keyboard.press('Control+a');
@@ -1065,16 +1087,28 @@ async function kindOf(page) {
 
   await shot(page, SHOT, { fullPage: false });
   console.log('screenshot →', SHOT);
+  // ego 通道：给编排器抓的机器可读行（publish-all 从 stdout 提取 spaceId 记台账/接管用）
+  if (session.driver === 'ego') console.log('spaceId : ' + session.spaceId);
   console.log('STATUS: 已停在发布按钮前，等待用户点击「发布」');
   log.finish('ok');
-  process.exit(0);
+  if (session.driver === 'ego') {
+    // ego：只有编排器标记的**序列最后一条命令**才交还用户（--handoff 1）。
+    // handOff 之后 agent 接管不了 —— 中间命令交还会让后续命令撞墙。
+    if (args.handoff === true || args.handoff === 1 || String(args.handoff) === '1') {
+      await session.handOff();
+    }
+    process.exitCode = 0; // ego 运行时自然结束（stdout 完整冲刷；不硬 exit）
+  } else {
+    process.exit(0); // playwright：CDP 连接可能挂着事件循环，维持原硬退出
+  }
 })().catch((e) => {
   console.error('FATAL', e.message);
   // 异常路径也要把日志收尾（耗时表 + 告警汇总），否则失败时反而没有留痕
   try {
     require('../lib/log.cjs')
-      .create({ platform: 'douyin', kind: (() => { try { return parseArgs(process.argv.slice(2)).kind || 'image'; } catch (_) { return 'image'; } })() })
+      .create({ platform: 'douyin', kind: (() => { try { return (globalThis.__OP_ARGS__ || parseArgs(process.argv.slice(2))).kind || 'image'; } catch (_) { return 'image'; } })() })
       .finish('failed');
   } catch (_) { /* 日志收尾失败不影响主流程 */ }
-  process.exit(1);
+  if (globalThis.__OP_ARGS__) process.exitCode = 1; // ego 运行时：自然结束
+  else process.exit(1);
 });

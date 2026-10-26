@@ -207,6 +207,27 @@ variants:                            # 分发变体：同一份内容的不同�
 3. 配置层加 `runtime.driver: playwright | <channel>`，默认 `playwright`，
    **开源用户零影响**。
 
+> ✅ **2026-10-27 阶段 1 落地（架构层 + 抖音示范，真机验证待做）**：
+> - `lib/driver.cjs` —— 通道工厂。通道判定：环境事实优先（`globalThis.__OP_ARGS__` 只可能由
+>   `bin/ego-run.ps1` 的 wrapper 注入），`runtime.driver` 是意图声明（声明 ego 却在普通
+>   node 里跑 → 明确报错，不静默回落）。patchright **惰性加载**（ego 运行时绝不 import 它）。
+> - `lib/drivers/ego.cjs` —— ego 门面，**回灌自 operation/04_skills/ego-publish/lib/runtime.mjs**
+>   （死页自愈 openSpaceAuto/getPage、截图竞速、filechooser 重试、fillGuard、fillEditor 等
+>   2026-10-22~24 真机验证过的实现）。对外暴露 Playwright 形状的 page/ctx：
+>   `url()` 异步化、`waitForEvent('filechooser')→waitForFileChooser`、`screenshot` 剥 timeout、
+>   `$()` 句柄走坐标点击避开多命中歧义、`locator().nth().screenshot()` 走 clip、
+>   和弦键位归一、多命中自动 `>> nth=0`。
+> - 编排器：`driver: ego` 时浏览器槽位自动改经 `bin/ego-run.ps1`（ScriptArgs 注入），
+>   每命令带 `--space-key`（同一内容多命令共享 TaskSpace），**最后一条命令**注入 `--handoff 1`
+>   （中间命令交还 = 后续命令接管撞墙），stdout 抓 `spaceId` 进槽位结果与台账 note。
+> - 抖音示范：bootstrap 换 driver 工厂、`page.url()`/`ctx.pages()` 异步化、`--force` 三形态归一；
+>   顺手修了存量 bug（`sleep()` 在 upload/cover 路径被裸调但从未定义 → ReferenceError）。
+> - 门面纯逻辑进 selftest（132 项全绿：死页自愈换名、接管被拒原样抛、截图剥 timeout 等）。
+> - **待真机验证**：`driver: ego` 下抖音 video + image 各一轮（终点 = 发布按钮前，人工点发布）。
+>   真机通过前，抖音之外的平台**尚未迁移**（仍是 playwright-only）。
+> - 已知边界：`>48MB` ego 下不直传（明确报错转人工）；ego 的 `keyboard.type` 的 `delay`
+>   选项未实测（若报 unknown option，门面剥掉即可，节奏由 waitForTimeout 保住）。
+
 ### 给贡献者的一条硬规矩
 
 **新加通道时，不要复制 `platforms/*.cjs`。**

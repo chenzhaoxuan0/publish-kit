@@ -126,6 +126,31 @@ node platforms/wechat.cjs push --media <目录> --title "..." --body-file <f.txt
 终点是**草稿箱**。个人主体账号的发布类 API 权限已被回收，脚本不碰那些接口，
 发布必须用户在 mp.weixin.qq.com 后台人工点。报 `invalid ip` 是 IP 白名单没加，不是 bug。
 
+### ego lite 通道（config.yaml `runtime.driver: "ego"`）
+
+同一份平台知识可跑在 ego lite 上（并行发布比单实例 CDP Chrome 快数倍）。
+通道差异全部收在 `lib/driver.cjs`（工厂）+ `lib/drivers/ego.cjs`（Playwright 形状门面），
+平台脚本一份代码两通道通用 —— **不要在平台脚本里写通道分支**。
+
+操作差异（对照上面的 playwright 流程）：
+
+| 环节 | playwright | ego |
+|---|---|---|
+| 启动 | `node platforms/douyin.cjs …` | 同一条命令，但 `driver: ego` 时**编排器自动**改经 `pwsh -NoProfile -File bin/ego-run.ps1 -Script platforms/<脚本> -ScriptArgs <json>` 启动；手工单跑也要走 ego-run.ps1（ego 运行时收不到 argv） |
+| 体检 | `node bin/doctor.cjs`（CDP/Chrome/profile） | 同一条命令，自动切成 ego 体检（找 ego-browser + 空间前缀） |
+| 登录 | `node bin/login.cjs <平台>` 开登录页 | **在 ego lite 窗口里登录**（登录态在 ego profile，所有 TaskSpace 共享） |
+| 并行 | 一个 Chrome 多标签页 | 每平台独立 TaskSpace，空间名 `pk-<平台>-<线>-<spaceKey>`（前缀 `runtime.space_prefix`，默认 `pk`，**与 operation 的 op 隔离**） |
+
+ego 通道的硬约束（脚本与编排器已内置，不要绕）：
+
+- **绝不调 `task.finish()`**（会关掉表单页）；交还用户只能经编排器注入的
+  `--handoff 1`（**只在序列最后一条命令**；中间命令交还 = 后续命令接管撞墙，ego hard stop）。
+- **绝不自动 `claimTaskSpace`**（需要用户批准）。空间救不活 → 门面自动换 `-r2/-r3` 新空间名。
+- `page.url()`/`ctx.pages()` 在两通道都按 `await` 写（playwright 同步值被 await 是无操作）。
+- evaluate 一律「无闭包捕获、至多一个参数」形状（ego 的硬约束；playwright 兼容）。
+- **>48MB 大文件不走 ego**（filechooser 大文件路径未实测）→ 脚本报错转人工，改 playwright 或人工接管。
+- 截图失败、`waitForSelector visible` 不可信等 ego 坑位已在门面里处理；判据永远在 DOM。
+
 ---
 
 ## 关键设计约定（改代码前必须理解）
