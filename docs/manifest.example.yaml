@@ -1,0 +1,177 @@
+# publish-kit 发布清单 —— 示例
+#
+# 用法：
+#   node bin/publish-manifest.cjs docs/manifest.example.yaml --dry-run
+#   node bin/publish-manifest.cjs docs/manifest.example.yaml --check-only
+#   node bin/publish-manifest.cjs docs/manifest.example.yaml
+#
+# ── 这份清单解决什么 ────────────────────────────────────────────
+#
+# 旧的用法是「一份物料打所有平台」：
+#
+#   node bin/publish-all.cjs --media ./cards --count 8 --title "标题" --body-file body.txt
+#
+# 但真实发布里，每个平台的物料都不一样：
+#   · 抖音 600 字简介 / 公众号 1200 字正文 / 知乎想法标题并进首行
+#   · 视频号标题 ≤16 字，必须**另起一版**短标题（不能截主标题）
+#   · B站要 4:3 + 16:9 两张封面，抖音要竖封面 + 横封面
+#
+# 清单把「这条内容要发到哪些平台、每个平台填什么」写成数据，
+# 体检、编排、留痕三处读**同一份** —— 改物料只改这一处。
+#
+# ── 字段说明 ────────────────────────────────────────────────────
+#
+# 顶层
+#   version         清单版本（当前 1）
+#   content.key     内容标识 —— 防重复发布闸门用它；同一 key + 同平台 + 同变体 = 只发一次
+#   content.domain  内容领域（可省）
+#   defaults        所有槽位的默认物料（可省）
+#   variants        分发变体：同一份内容的不同形态（图文线 / 视频线 / …）
+#   slots           顶层平铺的槽位（单变体时的简写，等价于 variants.default）
+#
+# 槽位
+#   platform        必填。douyin / weibo / zhihu / bilibili / shipinhao / wechat
+#   via             运行通道：browser（默认，浏览器填单）| api（公众号走 API）| manual（零自动化，只备料）
+#   kind            形态：image | video。**平台支持哪些形态是固定的**（B站与视频号只有视频线）
+#   title           标题
+#   titleFile       标题变体文件（**另起一版**，不是主标题的截断）
+#   bodyFile        正文/简介文件
+#   media           图集目录（图文线）
+#   count           要传几张图
+#   video           视频文件
+#   cover           封面文件
+#   covers          多个封面（按平台约定取位：抖音→竖/横，B站→主/16:9，其余→主）
+#   tags / tagsFile 标签（B站必填，不传脚本直接报错）
+#   options         平台专属开关（见下方各平台可用项；写了表外的会**直接报错**，不静默丢）
+#   limits          覆盖平台默认限制（titleMax / bodyMax / bodyWarn / bodyMin）
+#   weight          该槽位的典型耗时（秒）—— 编排时**最慢的先发**
+#   exclusive       true = 该槽位**独占**，不与其他槽位并发（平台限流时用）
+#   releaseFile     人工交割用的发布版本文件（via: manual 时必填或配 note）
+#   note            人工备注
+#
+# 平台专属开关（options）
+#   douyin    : album（合集名）· music（配乐曲名，**仅图文线有**）
+#   weibo     : channel（一级频道）· sub（二级频道）· no_declare（true = 不勾内容声明）
+#   zhihu     : field（所属领域）· title_in_body（true = 标题并入首行）· manual_images（true = 手动插图）
+#   shipinhao : album（合集名）· location（"off" = 不显示位置）
+#   bilibili  : （无）
+#   wechat    : （无）
+
+version: 1
+
+content:
+  key: "2026-10-26_AI热点速递卡片"
+  domain: "AI 科技"
+
+# ── 所有槽位共享的默认值（可省）────────────────────────────────
+defaults:
+  bodyFile: "manuscript/body.txt"
+
+# ── 分发变体 ───────────────────────────────────────────────────
+variants:
+  # 图文线
+  image:
+    label: 图文线
+    slots:
+      - platform: douyin
+        kind: image
+        title: "开发者用Codex：改造自家电视"
+        bodyFile: "manuscript/douyin.txt"
+        media: "upload-kit/media"
+        count: 8
+        weight: 68
+        options:
+          album: "每日新闻"
+          music: "Opus 37"
+
+      - platform: zhihu
+        kind: image
+        title: "开发者用Codex：改造自家电视"
+        bodyFile: "manuscript/zhihu.txt"
+        media: "upload-kit/media"
+        count: 8
+        weight: 27
+        options:
+          title_in_body: true
+
+      - platform: weibo
+        kind: image
+        title: "开发者用Codex：改造自家电视"
+        bodyFile: "manuscript/weibo.txt"
+        media: "upload-kit/media"
+        count: 8
+        weight: 14
+
+      - platform: wechat
+        kind: image
+        via: api
+        title: "开发者用Codex：改造自家电视"
+        bodyFile: "manuscript/gzh.txt"
+        media: "cards/output"
+        count: 8
+        weight: 5
+
+      - platform: xiaohongshu
+        via: manual
+        releaseFile: "manuscript/final-小红书.md"
+        note: "零自动化，仅备料 —— 请人工在小红书发布"
+
+  # 视频线
+  video:
+    label: 视频线
+    slots:
+      - platform: douyin
+        kind: video
+        title: "开发者用Codex：改造自家电视"
+        bodyFile: "manuscript/body.txt"
+        video: "video/release.mp4"
+        covers:
+          - "covers/cover-3x4.png"   # 竖封面
+          - "covers/cover-4x3.png"   # 横封面
+        weight: 116
+        options:
+          album: "每日新闻"
+
+      - platform: bilibili
+        kind: video
+        title: "开发者用Codex：改造自家电视"
+        bodyFile: "manuscript/body.txt"
+        video: "video/release.mp4"
+        covers:
+          - "covers/cover-4x3.png"   # 主封面
+          - "covers/cover-16x9.png"  # 16:9
+        tagsFile: "manuscript/bili-tags.txt"
+        weight: 69
+
+      - platform: zhihu
+        kind: video
+        title: "开发者用Codex：改造自家电视"
+        bodyFile: "manuscript/body.txt"
+        video: "video/release.mp4"
+        cover: "covers/cover-3x4.png"
+        weight: 76
+        options:
+          field: "科技互联网"
+
+      - platform: weibo
+        kind: video
+        title: "开发者用Codex：改造自家电视"
+        bodyFile: "manuscript/body.txt"
+        video: "video/release.mp4"
+        cover: "covers/cover-3x4.png"
+        weight: 40
+        options:
+          channel: "科技数码"
+
+      - platform: shipinhao
+        kind: video
+        # ⚠️ 视频号短标题 ≤16 字 —— 必须**另起一版**短标题，不能截主标题。
+        #    体检会按 16 字硬校验；文件缺失时回退到全局标题并照常报错。
+        titleFile: "manuscript/sph-title.txt"
+        bodyFile: "manuscript/body.txt"
+        video: "video/release.mp4"
+        cover: "covers/cover-3x4.png"
+        weight: 42
+        options:
+          album: "每日新闻"
+          location: "off"

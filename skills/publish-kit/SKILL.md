@@ -35,7 +35,8 @@ description: |
 | 情况 | 走哪条 |
 |---|---|
 | 物料已备好，要填 1 个平台 | 本 skill，单平台脚本 |
-| 物料已备好，要填多个平台 | 本 skill，`bin/publish-all.cjs` 并行 |
+| 物料已备好，要填多个平台（物料都一样） | 本 skill，`bin/publish-all.cjs` 并行 |
+| **各平台物料不一样**（正文/标题/封面各不同） | 本 skill，**发布清单** `bin/publish-manifest.cjs` |
 | 要写文案 / 做卡 / 出封面 | **不用本 skill**（那是内容生产环节） |
 | 要回填发布链接 / 收数据 | **不用本 skill** |
 | 小红书 | **无此通道**。备料 + 人工发布 |
@@ -94,9 +95,20 @@ node platforms/bilibili.cjs --video a.mp4 --title "标题" --body-file desc.txt 
 # 多平台并行（一条命令）
 node bin/publish-all.cjs --platforms douyin,weibo,zhihu --kind image \
      --media ./cards --count 8 --title "标题" --body-file body.txt
+
+# 多平台 + 各平台物料不同 → 发布清单（推荐）
+node bin/publish-manifest.cjs <清单.yaml> --dry-run     # 先看要跑什么
+node bin/publish-manifest.cjs <清单.yaml> --check-only  # 只体检，不起浏览器
+node bin/publish-manifest.cjs <清单.yaml>               # 真填单
 ```
 
+⚠️ **抖音是多命令模型**（`open`→`upload`→`fill`→`music`/`collect`→`cover`→`shot`，
+每步一个进程、靠浏览器里那个标签页续上下文）。**不要自己拼一条 `douyin.cjs` 命令**——
+不带子命令时它只会 `open` 然后退出（**只开页、没填单，却报成功**）。
+走清单模式或 `bin/publish-all.cjs` 才会展开成完整序列。
+
 完整命令面（每个平台的参数、用法、坑位）见 **`references/commands.md`**。
+发布清单的字段表见 **`docs/manifest.example.yaml`**。
 
 ### ④ 交割
 
@@ -105,6 +117,21 @@ node bin/publish-all.cjs --platforms douyin,weibo,zhihu --kind image \
 1. **看截图**（落 `publish.screenshot_dir`）—— 控制台说「已填」不等于填对了
 2. 告诉用户「已停在发布按钮前，请你点发布」，附截图路径
 3. **不要**自己点
+
+⚠️ **截图失败 ≠ 发布失败**：判据全在 DOM，截图只是留档。
+看到「⚠ 截图失败（已忽略，不影响填单结果）」**不要**当成失败重跑。
+
+### ⑤ 失败了怎么办
+
+编排层会自动诊断并给出**可执行**建议：
+
+| 诊断级别 | 你的动作 |
+|---|---|
+| `channel-dead` 通道不可用 | **别再填单**。跑 `node bin/doctor.cjs`；平台可能改版 → 读该平台脚本头的坑位注释 |
+| `login-required` 登录态失效 | `node bin/login.cjs <平台>` 让用户扫码。**不要自动重试** |
+| `content-rejected` 物料被拒 | 改物料。**重试无意义** |
+| `cosmetic` 仅截图失败 | 填单其实已经成了，通常不用管 |
+| `retryable` 偶发失败 | 编排层已自动重试过一次；仍失败 → 按 `channel-dead` 处理 |
 
 ---
 
@@ -122,6 +149,7 @@ node bin/publish-all.cjs --platforms douyin,weibo,zhihu --kind image \
 | 视频 | B站 | `node platforms/bilibili.cjs --video <mp4> --title "…" --body-file <f> --tags "a,b" --cover <png>` |
 | 视频 | 视频号 | `node platforms/shipinhao.cjs --video <mp4> --title "…" --body-file <f> --cover <png>` |
 | 全部 | 并行 | `node bin/publish-all.cjs --platforms a,b,c --kind image|video …` |
+| 全部 | 发布清单 | `node bin/publish-manifest.cjs <清单.yaml> [--dry-run] [--check-only]` |
 | 体检 | — | `node bin/doctor.cjs` · `node bin/login.cjs <平台>` |
 
 ⚠️ **平台侧硬限制**（超了平台会拦，脚本也会在起浏览器前体检拦下）：
@@ -148,6 +176,8 @@ node bin/publish-all.cjs --platforms douyin,weibo,zhihu --kind image \
 | `某平台未登录/字段未配置` | 正常。脚本会跳过并告警，转人工处理，**不要自己编一个值填上** |
 | 选中的元素点不动 | 需要真实 `mouse.click` 而非合成 click，读该平台脚本头的坑位注释 |
 | 视频传不进去（>50MB） | 走 `setVideoFile()`，不要自己写 `setInputFiles` |
+| **抖音只开了页、没填单** | 抖音是多命令模型。走清单模式或 `bin/publish-all.cjs`，别自己拼单条命令 |
+| **截图失败** | **不是发布失败**。判据全在 DOM，截图只是留档 |
 | `invalid ip`（公众号） | 本机公网 IP 不在白名单。`node platforms/wechat.cjs ip` 看当前出口 IP → 后台加白名单 → 5–10 分钟生效 |
 | 平台报「口径未确认」 | 平台可能改版了。读该平台脚本头的**坑位注释**（带实测日期），别靠反复实跑试探 |
 

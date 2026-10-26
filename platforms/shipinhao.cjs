@@ -78,6 +78,8 @@ const fs = require('fs');
 const path = require('path');
 const cfg = require('../lib/config.cjs');
 const { setVideoFile, cdpSetFiles, LIMIT: BIG_LIMIT } = require('../lib/bigfile-upload.cjs');
+// 2026-10-26 内化：截图留档层——截图失败只告警，不参与成败判据
+const { shot } = require('../lib/shot.cjs');
 
 let chromium;
 try {
@@ -818,7 +820,7 @@ function locateUploadTrigger(p, inputSel, hintRe, acceptRe) {
   }
 
   // 6) 截图，停「发表」前（合集/位置/视频标注等其余表单由人工核对；封面已 --cover 自动化）
-  await p.screenshot({ path: SHOT });
+  await shot(p, SHOT);
   console.log('screenshot →', SHOT);
   console.log('STATUS: 已停在「发表」按钮前，等待用户点击发表');
   log.step('已停在「发表」前', SHOT);

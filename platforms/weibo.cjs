@@ -91,6 +91,8 @@ const { setVideoFile, resolveOpenFileChooser } = require('../lib/bigfile-upload.
 const { sleep, pickFileWithRetry, fillLongText } = require('../lib/wait.cjs');
 const { create } = require('../lib/log.cjs');
 const { preflight } = require('../lib/preflight.cjs');
+// 2026-10-26 内化：截图留档层——截图失败只告警，不参与成败判据
+const { shot } = require('../lib/shot.cjs');
 
 // 运行日志器（**旁路**：只多打印，不改变任何既有 console.log 的行为与时机）。
 // 放模块作用域是为了让末尾的 .catch() 也能收尾（异常路径要写 failed）。
@@ -803,7 +805,7 @@ function parseArgs(argv) {
   if (channelOnly) {
     // channel 模式到此为止：只做了分类这一件事，不碰视频/封面/标题/正文。
     const r = await selectChannel(p, args.channel, args.sub || null);
-    await p.screenshot({ path: SHOT });
+    await shot(p, SHOT);
     console.log('screenshot →', SHOT);
     if (!r.ok) {
       console.error('FATAL 分类频道未选中（' + r.diag + '）——表单未被改动，请人工在下拉里手选');
@@ -920,7 +922,7 @@ function parseArgs(argv) {
     else log.warn('封面比例验证未通过，请人工核对截图');
   }
   // 4) 截图，停「发送」前
-  await p.screenshot({ path: SHOT });
+  await shot(p, SHOT);
   console.log('screenshot →', SHOT);
   console.log('STATUS: 已停在「发送」按钮前，等待用户点击发送（发送前请确认缩略图为视频模式）');
   log.step('收尾', '停在「发送」按钮前');

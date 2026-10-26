@@ -83,6 +83,8 @@ const { setVideoFile } = require('../lib/bigfile-upload.cjs');
 const { sleep, fillLongText, pickFileWithRetry } = require('../lib/wait.cjs');
 const { create } = require('../lib/log.cjs');
 const { preflight } = require('../lib/preflight.cjs');
+// 2026-10-26 内化：截图留档层——截图失败只告警，不参与成败判据
+const { shot } = require('../lib/shot.cjs');
 
 // 每平台独立日志（旁路）。异常路径也要收尾，否则失败时反而没有留痕。
 let log = null;
@@ -519,7 +521,7 @@ function parseArgs(argv) {
   }
 
   // 9) 截图，停「发布视频」前
-  await p.screenshot({ path: SHOT });
+  await shot(p, SHOT);
   console.log('screenshot →', SHOT);
   console.log('STATUS: 已停在「发布视频」按钮前，等待用户点击发布');
   log.step('已停在「发布视频」前', SHOT);

@@ -68,6 +68,8 @@ const fs = require('fs');
 const path = require('path');
 const cfg = require('../lib/config.cjs');
 const { setVideoFile } = require('../lib/bigfile-upload.cjs');
+// 2026-10-26 内化：截图留档层——截图失败只告警，不参与成败判据
+const { shot } = require('../lib/shot.cjs');
 
 let chromium;
 try {
@@ -1061,7 +1063,7 @@ async function kindOf(page) {
     }
   }
 
-  await page.screenshot({ path: SHOT, fullPage: false });
+  await shot(page, SHOT, { fullPage: false });
   console.log('screenshot →', SHOT);
   console.log('STATUS: 已停在发布按钮前，等待用户点击「发布」');
   log.finish('ok');

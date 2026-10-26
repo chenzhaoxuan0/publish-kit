@@ -61,6 +61,8 @@ const { chromium } = require('patchright');
 const { sleep, waitFor, pickFileWithRetry } = require('../lib/wait.cjs');
 const { create } = require('../lib/log.cjs');
 const { preflight, listImages } = require('../lib/preflight.cjs');
+// 2026-10-26 内化：截图留档层——截图失败只告警，不参与成败判据
+const { shot } = require('../lib/shot.cjs');
 
 // 运行日志器（**旁路**：只多打印，不改变任何既有 console.log 的行为与时机）。
 // 放模块作用域是为了让末尾的 .catch() 也能收尾（异常路径要写 failed）。
@@ -312,7 +314,7 @@ function parseArgs(argv) {
   console.log('「发送」按钮:', sendBtn ? '存在（未点击）' : '未找到');
   fs.mkdirSync(cfg.screenshotDir(), { recursive: true });
   const SHOT = shotPath('weibo-image.png');
-  await p.screenshot({ path: SHOT, fullPage: false });
+  await shot(p, SHOT, { fullPage: false });
   console.log('screenshot →', SHOT);
   console.log('STATUS: 已停在「发送」前，等待用户人工点击');
   log.step('收尾', '停在「发送」前');

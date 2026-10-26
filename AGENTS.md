@@ -63,10 +63,57 @@ node platforms/<platform>.cjs --video <mp4> --title "<标题>" --body-file <正�
    视频走 5 个平台脚本；图文走 `douyin.cjs --kind image` / `weibo-image.cjs` / `zhihu-pin.cjs` /
    `wechat.cjs`。每个脚本的文件头有完整用法，**先读文件头再执行**。
 
+   **多个平台、且各平台物料不同时 → 用发布清单**（见下节）：
+   ```bash
+   node bin/publish-manifest.cjs <清单.yaml> [--dry-run] [--check-only]
+   ```
+
 3. 脚本每步会截图到 `config.yaml` 的 `publish.screenshot_dir`。**你要看截图确认填单结果**，
    不要只看控制台说「已填」就算完。
 
+   ⚠️ **截图失败不影响成败判据** —— 判据全在 DOM，截图只是留档。
+   看到「⚠ 截图失败（已忽略，不影响填单结果）」**不要**当成发布失败重跑。
+
 4. 停下后告诉用户「已停在发布按钮前，请你点发布」，并附上截图路径。
+
+### 发布清单（多平台 / 多形态 / 多内容类型）
+
+当「一次要发多个平台」且**各平台的物料不一样**时，用清单而不是扁平 CLI 参数：
+
+```bash
+node bin/publish-manifest.cjs <清单.yaml> --dry-run     # 先看要跑什么
+node bin/publish-manifest.cjs <清单.yaml> --check-only  # 只体检
+node bin/publish-manifest.cjs <清单.yaml>               # 真填单
+```
+
+清单长什么样见 `docs/manifest.example.yaml`。要点：
+
+- **每个槽位有自己的物料**：`title` / `titleFile`（平台专属标题变体）/ `bodyFile` /
+  `media` + `count` / `video` / `cover` / `covers[]` / `tags`
+- **平台专属开关进 `options:`**（抖音 `album`/`music`、微博 `channel`/`sub`、
+  知乎 `field`、视频号 `album`/`location`）——写表外的开关**直接报错**，不会静默丢
+- **`via`** 表达运行通道：`browser` / `api` / `manual`
+- **`via: manual` 的槽位不会执行任何自动化**，只在结果里提醒你人工去发
+  （零自动化是账号级决策，工具不替你破例）
+
+⚠️ **体检不过就不起浏览器** —— 清单的校验（物料缺失 / 图集不足 / 标题超限 / 未知开关）
+全是秒级的本地检查，失败会直接中止。
+
+### 失败之后
+
+编排层会自动诊断并给出**可执行**建议（`lib/diagnose.cjs`）。按建议走，不要盲目重跑：
+
+| 级别 | 你的动作 |
+|---|---|
+| `channel-dead` 通道不可用 | **别再填单**。跑 `node bin/doctor.cjs` 看 CDP 是否在线；平台可能改版了 → 读该平台脚本文件头的坑位注释 |
+| `login-required` 登录态失效 | `node bin/login.cjs <平台>` 让用户扫码。**不要自动重试** |
+| `content-rejected` 素材被拒 | 改物料（缺什么补什么）。**重试无意义** |
+| `cosmetic` 仅截图失败 | 填单其实已经成了，通常不用管 |
+| `retryable` 偶发失败 | 编排层已自动重试过一次；仍失败 → 按 channel-dead 处理 |
+
+⚠️ **自动重试有边界**（别绕过它）：只重跑**失败的那一步**，且该步必须幂等
+（重新上传素材那一步不幂等 → 不重跑）；**API 通道（公众号永久素材）永不自动重跑**。
+
 
 ### 公众号（走官方 API，不经浏览器）
 
@@ -166,10 +213,15 @@ node platforms/wechat.cjs push --media <目录> --title "..." --body-file <f.txt
 | 人看的停顿 | `lib/wait.cjs` 的 `humanDelay(min, max, step)`（**不要**拿它当等待条件） |
 | 灌长文本 | `lib/wait.cjs` 的 `fillLongText(page, readLength, text)`（自带回读校验 + 自动退回逐块输入） |
 | 上传入口点击 | `lib/wait.cjs` 的 `pickFileWithRetry(page, locateEntry)`（最多重试 3 次，每次重新取坐标） |
+| 截图留档 | `lib/shot.cjs` 的 `shot(page, path)`（**永不抛异常**，失败只告警） |
 | 记录耗时与告警 | `lib/log.cjs` 的 `create({platform, kind})` → `log.step() / log.warn() / log.finish()` |
 | 起浏览器前体检 | `lib/preflight.cjs` 的 `preflight({...})`（图集张数 / 正文长度 / 违禁 / 标题） |
 | 防重复发布 | `lib/ledger.cjs`（**可选**，配了 `publish.ledger` 才启用） |
 | 多平台并行 | `bin/publish-all.cjs`（不要自己写调度） |
+| **多平台各自物料** | `lib/manifest.cjs` + `bin/publish-manifest.cjs`（**不要**自己拼参数） |
+| **平台信息（形态/脚本/耗时/限制）** | `lib/platforms.cjs`（**平台注册表，唯一事实源** —— 不要另抄一份） |
+| **失败诊断** | `lib/diagnose.cjs` 的 `diagnose({code, stdout})` |
+| **链接该属于哪个平台** | `lib/platform-urls.cjs` 的 `urlMatchesPlatform(url, platform)` |
 
 ⚠️ **不要绕过 `lib/bigfile-upload.cjs`**：>48MB 的视频必须走它的 `setVideoFile()`，
 微博必须走 `resolveOpenFileChooser()`。
@@ -187,7 +239,7 @@ node platforms/wechat.cjs push --media <目录> --title "..." --body-file <f.txt
 改完 `lib/` 下的模块后跑：
 
 ```bash
-node selftest.cjs      # 33 项，覆盖等待/日志/体检/台账/编排
+node selftest.cjs      # 104 项，覆盖等待/日志/体检/台账/编排/清单/诊断/截图/链接闸
 ```
 
 平台脚本的改动至少跑一次 `node --check platforms/<file>.cjs`。
@@ -207,6 +259,12 @@ node selftest.cjs      # 33 项，覆盖等待/日志/体检/台账/编排
 | 视频传不进去（>50MB） | 确认走的是 `setVideoFile()`，不要自己写 `setInputFiles` |
 | 判定恒为空 / 恒失败 | **先写探针抓地面真相**，别在同一个假设上调参数（见上面「调试纪律」） |
 | 图集体检说「缺 01, 02」但文件明明在 | 命名约定：`img-01.png` / `01.png` / `card_34_01.png` 都认；改 `lib/preflight.cjs` 的 `listImages` 时注意 |
+| 图集体检说「序号断了」 | 目录里的序号不连续（01,02,04）→ **顺序会错位**。确认是「漏生成」还是「命名跳号」，补齐再发 |
+| 清单体检说「不认识开关 options.X」 | 该平台没有这个开关。查 `lib/manifest.cjs` 的 `OPTION_FLAGS` / `STEP_OPTIONS` / `VALUE_LESS_OPTIONS`；**不要**为了绕过它去改脚本 |
+| 清单体检说「不认识平台 X」 | 若该平台走**零自动化**，显式写 `via: manual`（只备料）；否则本工具确实不支持它 |
+| 抖音只开了页、没填单 | 抖音是多命令模型（open→upload→fill→…→shot）。**必须走清单模式或 `bin/publish-all.cjs`**，不要自己拼单条 `douyin.cjs` 命令 |
+| 截图失败 | **不是发布失败**。判据全在 DOM，截图只是留档。看控制台那行「⚠ 截图失败（已忽略）」即可 |
+| 公众号 `check` 退出码异常 / 崩溃 | 已修（Windows libuv 断言）。仍异常 → 查凭证与 IP 白名单 |
 
 改完任何平台脚本后，至少跑一次 `node --check platforms/<file>.cjs`。
 改完 `lib/` 下任何模块后，跑一次 `node selftest.cjs`。

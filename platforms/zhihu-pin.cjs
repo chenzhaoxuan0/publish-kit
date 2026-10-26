@@ -83,6 +83,8 @@ const { chromium } = require('patchright');
 const { sleep, fillLongText, pickFileWithRetry } = require('../lib/wait.cjs');
 const { create } = require('../lib/log.cjs');
 const { preflight, listImages } = require('../lib/preflight.cjs');
+// 2026-10-26 内化：截图留档层——截图失败只告警，不参与成败判据
+const { shot } = require('../lib/shot.cjs');
 
 // 每平台独立日志（旁路）。异常路径也要收尾，否则失败时反而没有留痕。
 let log = null;
@@ -592,7 +594,7 @@ function matchStripToSources(items, srcDims) {
   if (!pub) log.warn('没找到「发布」按钮（编辑态文案）—— 请人工确认页面状态');
   fs.mkdirSync(cfg.screenshotDir(), { recursive: true });
   const SHOT = shotPath('zhihu-pin.png');
-  await p.screenshot({ path: SHOT, fullPage: false });
+  await shot(p, SHOT, { fullPage: false });
   console.log('screenshot →', SHOT);
   console.log('STATUS: 已停在「发布」前，等待用户人工点击');
   log.step('已停在「发布」前', SHOT);

@@ -135,6 +135,80 @@ skill 的价值不在「教会模型敲命令」，而在**固化三条容易被
 | `lib/preflight.cjs` | **起浏览器之前**的体检：图集张数 vs 实际、正文长度区间、违禁内容、标题长度 | 见下面「判据的前提」 |
 | `lib/ledger.cjs` | 可选发布台账 + **防重复发布闸门** | 「绝不重复发布」需要跨进程、跨期的事实源 |
 | `lib/publish-all.cjs` | 并行编排器：长任务优先调度 + 并发上限 | 见下面「并行」 |
+| `lib/manifest.cjs` | **平台中立发布清单**：每个平台用自己的标题/正文/封面/标签 | 见下面「发布清单」 |
+| `lib/diagnose.cjs` | 失败自动诊断：把失败分成 6 级，每级给一条可执行建议 | 「失败之后该干什么」不该靠人肉翻日志 |
+| `lib/shot.cjs` | 截图降级为告警：6s 短路超时、**永不抛异常** | 截图是留档，判据全在 DOM —— 截图失败不该让整轮发布作废 |
+| `lib/platforms.cjs` | **平台注册表**（唯一事实源）：形态 / 脚本 / 登录判据 / 实测耗时 / 限制 | 平台信息散在 4 处 → 漏改一处就静默失效 |
+| `lib/platform-urls.cjs` | 平台↔链接域名闸 + 匿名 GET 核验 | 链接贴错格子会被预填链路**反复复活** |
+| `lib/bigfile-upload.cjs` | >48MB 视频走 CDP 原生直传 | 见下面「大文件」 |
+
+### 发布清单（每个平台用自己的物料）
+
+「一份物料打所有平台」回答不了真实发布：抖音 600 字简介 / 公众号 1200 字正文 /
+知乎想法标题并进首行 / 视频号标题 ≤16 字（必须**另起一版**，截主标题会截出半句话）/
+B站要 4:3 + 16:9 两张封面而抖音要竖封面 + 横封面。
+
+**发布清单**把「这条内容要发到哪些平台、每个平台填什么」写成数据，体检、编排、留痕读**同一份**：
+
+```bash
+node bin/publish-manifest.cjs publish.yaml            # 按清单填单
+node bin/publish-manifest.cjs publish.yaml --dry-run  # 只打印将要跑什么
+node bin/publish-manifest.cjs publish.yaml --check-only  # 只体检，不起浏览器
+node bin/publish-manifest.cjs publish.yaml --variants image --only douyin,zhihu
+```
+
+```yaml
+version: 1
+content:
+  key: "2026-10-26_AI热点速递卡片"   # 防重复闸门的内容标识
+variants:                            # 分发变体：同一份内容的不同形态
+  image:
+    slots:
+      - platform: douyin
+        kind: image
+        title: "开发者用Codex：改造自家电视"
+        bodyFile: "manuscript/douyin.txt"
+        media: "upload-kit/media"
+        count: 8
+        options: { album: "每日新闻", music: "Opus 37" }
+      - platform: xiaohongshu
+        via: manual                        # 零自动化，只备料
+        note: "零自动化，仅备料"
+  video:
+    slots:
+      - platform: shipinhao
+        kind: video
+        titleFile: "manuscript/sph-title.txt"   # 平台专属标题变体（另起一版）
+        video: "video/release.mp4"
+        covers: ["covers/cover-3x4.png"]
+```
+
+完整字段表见 [`docs/manifest.example.yaml`](docs/manifest.example.yaml)。
+
+四条约定：
+
+1. **路径相对清单文件所在目录**（不相对工作区根）—— 清单要能随内容目录搬家
+2. **`via` 表达运行通道**（`browser` / `api` / `manual`），**不用 `channel`** ——
+   `channel` 在微博语境里是「一级频道」，两个含义撞在一起会让清单读起来像 bug
+3. **平台专属开关进 `options:`**；写表外的开关**直接报错**，不静默丢
+4. **未知平台必须显式写 `via: manual`** —— 漏声明会被拦下来，
+   免得把「零自动化」变成「忘了配」
+
+### 失败之后该干什么
+
+平台脚本失败时，编排层会自动诊断并给一条**可执行**建议：
+
+| 级别 | 含义 | 自动重试？ |
+|---|---|---|
+| `channel-dead` | 通道整体不可用（导航 / 执行上下文 / CDP） | ❌ 先修通道，别再填单 |
+| `login-required` | 登录态失效 / 公众号凭证与 IP 白名单 | ❌ 让用户扫码 |
+| `content-rejected` | 素材或文案被平台拒 | ❌ 改物料 |
+| `cosmetic` | 只是截图失败 | ✅ 填单其实已经成了 |
+| `retryable` | 偶发失败（超时 / 点击没生效） | ✅ 重跑一次 |
+| `unknown` | 认不出来 | ❌ 给人看 |
+
+自动重试**只重跑失败的那一步**，且该步必须幂等（重新上传素材那一步不幂等 → 不重跑）；
+**API 通道（公众号永久素材）永不自动重跑**。
 
 ### 判据的前提是 count 本身对
 
@@ -201,6 +275,11 @@ node bin/publish-all.cjs --platforms douyin,weibo,zhihu --kind image \
      --media ./cards --count 8 --title "标题" --body-file body.txt
 node bin/publish-all.cjs --platforms douyin,weibo,zhihu,bilibili,shipinhao --kind video \
      --video a.mp4 --title "标题" --body-file desc.txt --cover c.png --concurrency 5
+
+# 发布清单（每个平台用自己的物料）—— 推荐
+node bin/publish-manifest.cjs publish.yaml
+node bin/publish-manifest.cjs publish.yaml --dry-run
+node bin/publish-manifest.cjs publish.yaml --check-only
 
 # 自检（改完 lib/ 跑一次）
 node selftest.cjs

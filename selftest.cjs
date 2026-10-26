@@ -4,8 +4,11 @@
 //   1) lib/wait.cjs      —— waitFor / waitForOrNull / humanDelay / fillLongText / pickFileWithRetry
 //   2) lib/log.cjs       —— 日志落盘 + 耗时表 + 告警汇总
 //   3) lib/preflight.cjs —— 图集张数 vs 实际 / 正文长度 / 违禁 / 标题
-//   4) lib/ledger.cjs    —— 防重复闸门 + 写回不静默丢记录
-//   5) lib/publish-all.cjs —— 长任务优先调度 + 并发上限
+//   4) lib/ledger.cjs    —— 防重复闸门 + 写回不静默丢记录 + 变体维度
+//   5) lib/publish-all.cjs —— 长任务优先调度 + 并发上限 + 命令序列
+//   6) lib/manifest.cjs  —— 发布清单：解析 / 槽位展开 / 命令序列 / 校验
+//   7) lib/diagnose.cjs  —— 失败分级：通道 / 登录 / 内容 / 截图 / 可重试
+//   8) lib/shot.cjs      —— 截图降级（永不抛异常）
 //
 // 用法：node selftest.cjs
 const fs = require('fs');
@@ -278,11 +281,22 @@ section('lib/publish-all.cjs');
   const cfg = require('./lib/config.cjs');
 
   // 各平台都能拼出命令
-  for (const p of ['douyin', 'weibo', 'zhihu', 'bilibili', 'shipinhao', 'wechat']) {
-    const b = buildCommand(p, { kind: 'image', title: 't', bodyFile: 'b.txt' });
-    ok(`${p} 能拼出命令`, !!b && b.cmd && Array.isArray(b.args) && b.args.length > 0);
+  // ⚠️ **形态要对**：B站与视频号只有视频线，公众号只有图文线 —— 这是事实，
+  //    不是配置问题。旧版这里对所有平台都用 kind=image，于是给 B站拼出了一条
+  //    「跑起来必然报缺 --video」的假命令。
+  const combos = [
+    ['douyin', 'image'], ['douyin', 'video'],
+    ['weibo', 'image'], ['weibo', 'video'],
+    ['zhihu', 'image'], ['zhihu', 'video'],
+    ['bilibili', 'video'], ['shipinhao', 'video'],
+    ['wechat', 'image'],
+  ];
+  for (const [p, kind] of combos) {
+    const b = buildCommand(p, { kind, title: 't', bodyFile: 'b.txt' });
+    ok(`${p}/${kind} 能拼出命令`, !!b && b.cmd && Array.isArray(b.args) && b.args.length > 0);
   }
   ok('未知平台返回 null', buildCommand('nope', {}) === null);
+  ok('平台没有该形态时返回 null（B站无图文线）', buildCommand('bilibili', { kind: 'image' }) === null);
   ok('实测耗时表非空', Object.keys(MEASURED).length >= 8);
 
   // ⚠️ 编排器**绝不能在物料不全时启动任何平台脚本**：
@@ -317,6 +331,345 @@ section('lib/publish-all.cjs');
     });
   } catch (_) { /* 未启用平台会抛错，plan 事件可能已发出 */ }
   ok('调度计划可产出', !!plan || true); // enabled 过滤后为空也正常
+}
+
+// ═══ 6. lib/manifest.cjs ═══════════════════════════════════════════
+section('lib/manifest.cjs');
+{
+  const manifest = require('./lib/manifest.cjs');
+
+  // 造一个最小内容目录：3 张图 + 正文 + 短标题
+  const proj = path.join(tmp, 'proj');
+  fs.mkdirSync(path.join(proj, 'media'), { recursive: true });
+  for (let i = 1; i <= 3; i++) {
+    fs.writeFileSync(path.join(proj, 'media', `img-0${i}.png`), 'x');
+  }
+  fs.writeFileSync(path.join(proj, 'body.txt'), '正文内容');
+  fs.writeFileSync(path.join(proj, 'sph.txt'), '短标题');
+
+  const mf = path.join(proj, 'publish.yaml');
+  fs.writeFileSync(
+    mf,
+    [
+      'version: 1',
+      'content:',
+      '  key: "k1"',
+      'variants:',
+      '  image:',
+      '    slots:',
+      '      - platform: douyin',
+      '        kind: image',
+      '        title: "标题A"',
+      '        bodyFile: "body.txt"',
+      '        media: "media"',
+      '        count: 3',
+      '        options:',
+      '          album: "合集A"',
+      '          music: "Opus 37"',
+      '  video:',
+      '    slots:',
+      '      - platform: shipinhao',
+      '        kind: video',
+      '        titleFile: "sph.txt"',
+      '        bodyFile: "body.txt"',
+      '        video: "media/img-01.png"',
+      '        options:',
+      '          location: "off"',
+    ].join('\n')
+  );
+
+  const plan = manifest.buildPlan(mf);
+  ok('清单解析出 2 个槽位', plan.slots.length === 2, `实得 ${plan.slots.length}`);
+  ok('体检无 FAIL', plan.problems.fail.length === 0, plan.problems.fail.join('; '));
+
+  const dy = plan.slots.find((s) => s.platform === 'douyin');
+  ok('相对路径按清单目录解析', dy && path.isAbsolute(dy.media) && dy.media.endsWith('media'));
+  ok('content.key 读到了', plan.content.key === 'k1');
+
+  // ⚠️ **抖音必须是一条命令序列**，不能是一条 —— 早期版本只拼了一条
+  //    不带子命令的命令，而 douyin.cjs 默认子命令是 open → 只开页不填单却报成功。
+  ok('抖音是多命令序列', dy && dy.commands.length >= 4, `${dy ? dy.commands.length : 0} 步`);
+  ok(
+    '抖音序列第一步是 open',
+    dy && dy.commands[0].args[0] === 'open' && dy.commands[0].args.includes('image')
+  );
+  ok('抖音序列含 upload 步骤', dy && dy.commands.some((c) => c.args[0] === 'upload'));
+  ok('抖音序列含 fill 步骤', dy && dy.commands.some((c) => c.args[0] === 'fill'));
+  ok('抖音 upload 步骤标为非幂等（不自动重试）', dy && dy.commands.some((c) => c.args[0] === 'upload' && c.idempotent === false));
+  ok('抖音配乐是独立步骤', dy && dy.commands.some((c) => c.args[0] === 'music'));
+
+  // 平台专属开关 → 命令行参数
+  const dyArgs = dy.commands.map((c) => c.args.join(' ')).join(' | ');
+  ok('合集名进了 collect 步骤', /collect .*--album 合集A/.test(dyArgs));
+
+  // 视频号：标题变体文件 + 位置开关
+  const sph = plan.slots.find((s) => s.platform === 'shipinhao');
+  ok('标题变体文件被读入', sph && sph.title === '短标题');
+  ok('视频号 ≤16 字硬校验通过', sph && [...sph.title].length <= 16);
+  ok('视频号位置开关进了命令行', sph && sph.commands[0].args.includes('--location'));
+
+  // 校验：缺文件 → FAIL
+  const bad = manifest.buildPlan(mf, { variants: ['nonexistent'] });
+  ok('不存在的变体 → 无槽位', bad.slots.length === 0);
+
+  // 校验：图集不足 → FAIL
+  fs.mkdirSync(path.join(proj, 'media2'), { recursive: true });
+  fs.writeFileSync(path.join(proj, 'media2', 'img-01.png'), 'x');
+  const mf2 = path.join(proj, 'bad.yaml');
+  fs.writeFileSync(
+    mf2,
+    ['version: 1', 'slots:', '  - platform: douyin', '    kind: image', '    title: "t"',
+     '    bodyFile: "body.txt"', '    media: "media2"', '    count: 3'].join('\n')
+  );
+  const badPlan = manifest.buildPlan(mf2);
+  ok('图集不足 → FAIL', badPlan.problems.fail.some((f) => /图集不足/.test(f)));
+  ok('图集不足的槽位不进执行计划', badPlan.slots.length === 0);
+
+  // 校验：未知开关 → FAIL（不静默丢）
+  const mf3 = path.join(proj, 'bad2.yaml');
+  fs.writeFileSync(
+    mf3,
+    ['version: 1', 'slots:', '  - platform: douyin', '    kind: image', '    title: "t"',
+     '    bodyFile: "body.txt"', '    media: "media"', '    count: 3',
+     '    options:', '      不存在的开关: 1'].join('\n')
+  );
+  const badPlan3 = manifest.buildPlan(mf3);
+  ok('未知开关 → FAIL（不静默丢）', badPlan3.problems.fail.some((f) => /不认识开关/.test(f)));
+
+  // 校验：视频号标题超 16 字 → FAIL
+  const mf4 = path.join(proj, 'bad3.yaml');
+  fs.writeFileSync(
+    mf4,
+    ['version: 1', 'slots:', '  - platform: shipinhao', '    kind: video',
+     '    title: "这个标题明显超过十六个字了肯定会撞墙"', '    bodyFile: "body.txt"',
+     '    video: "media/img-01.png"'].join('\n')
+  );
+  const badPlan4 = manifest.buildPlan(mf4);
+  ok('视频号标题超 16 字 → FAIL', badPlan4.problems.fail.some((f) => /16 字/.test(f)));
+
+  // 平台没有该形态 → FAIL
+  const mf5 = path.join(proj, 'bad4.yaml');
+  fs.writeFileSync(
+    mf5,
+    ['version: 1', 'slots:', '  - platform: bilibili', '    kind: image', '    title: "t"',
+     '    bodyFile: "body.txt"', '    media: "media"', '    count: 3'].join('\n')
+  );
+  const badPlan5 = manifest.buildPlan(mf5);
+  ok('B站没有图文线 → FAIL', badPlan5.problems.fail.some((f) => /没有 image 形态/.test(f)));
+
+  // 人工通道：只备料，不要求物料齐全
+  const mf6 = path.join(proj, 'manual.yaml');
+  fs.writeFileSync(
+    mf6,
+    ['version: 1', 'slots:', '  - platform: douyin', '    via: manual',
+     '    releaseFile: "body.txt"', '    note: "零自动化，仅备料"'].join('\n')
+  );
+  const manualPlan = manifest.buildPlan(mf6);
+  ok('manual 通道 → 体检通过且不进执行计划（有命令才执行）',
+     manualPlan.problems.fail.length === 0);
+}
+
+// ═══ 7. lib/diagnose.cjs ════════════════════════════════════════════
+section('lib/diagnose.cjs');
+{
+  const { diagnose, VERDICT } = require('./lib/diagnose.cjs');
+
+  const d1 = diagnose({ code: 1, stdout: 'Error: connectOverCDP: ECONNREFUSED 127.0.0.1:39223' });
+  ok('CDP 连不上 → 通道不可用', d1.verdict === VERDICT.CHANNEL_DEAD, d1.verdict);
+  ok('通道不可用 → 不允许重试', d1.canRetry === false);
+
+  const d2 = diagnose({ code: 1, stdout: 'page.goto: Timeout 30000ms exceeded' });
+  ok('导航超时 → 通道不可用（不重试）', d2.verdict === VERDICT.CHANNEL_DEAD, d2.verdict);
+
+  const d3 = diagnose({ code: 1, stdout: '未登录，请扫码' });
+  ok('未登录 → 登录态失效', d3.verdict === VERDICT.LOGIN_REQUIRED, d3.verdict);
+  ok('登录态失效 → 不允许重试', d3.canRetry === false);
+
+  const d4 = diagnose({ code: 1, stdout: 'Error: 缺 --body-file 或文件不存在' });
+  ok('缺物料 → 内容被拒', d4.verdict === VERDICT.CONTENT_REJECTED, d4.verdict);
+  ok('内容被拒 → 不允许重试', d4.canRetry === false);
+
+  const d5 = diagnose({ code: 1, stdout: '截图失败（已忽略，不影响填单结果）' });
+  ok('截图失败 → 仅截图失败', d5.verdict === VERDICT.COSMETIC, d5.verdict);
+
+  const d6 = diagnose({ code: 1, stdout: '点上传入口 3 次都没唤起文件选择器' });
+  ok('点击没生效 → 可重试', d6.verdict === VERDICT.RETRYABLE, d6.verdict);
+  ok('可重试 → 允许重试', d6.canRetry === true);
+
+  const d7 = diagnose({ code: 1, stdout: '完全看不懂的报错' });
+  ok('认不出 → unknown 且不自动重试', d7.verdict === VERDICT.UNKNOWN && d7.canRetry === false, d7.verdict);
+
+  // 公众号凭证类问题归到「要人工处理」
+  const d8 = diagnose({ code: 1, stdout: '{"errcode":40164,"errmsg":"invalid ip"}' });
+  ok('公众号 invalid ip → 登录/凭证类', d8.verdict === VERDICT.LOGIN_REQUIRED, d8.verdict);
+}
+
+// ═══ 8. lib/shot.cjs ═══════════════════════════════════════════════
+section('lib/shot.cjs');
+{
+  const { shot } = require('./lib/shot.cjs');
+  const out = path.join(tmp, 'shot.png');
+
+  // 假 page：截图成功
+  const okRes = await shot({ screenshot: async () => 'ok' }, out);
+  ok('截图成功 → ok:true', okRes.ok === true);
+
+  // 假 page：截图抛异常 —— 必须**不外抛**
+  let threw = false;
+  let errRes = null;
+  try {
+    errRes = await shot({ screenshot: async () => { throw new Error('boom'); } }, out);
+  } catch (_) {
+    threw = true;
+  }
+  ok('截图抛异常 → 不外抛', threw === false);
+  ok('截图抛异常 → ok:false 且带原因', errRes && errRes.ok === false && !!errRes.reason);
+
+  // 假 page：截图挂死 —— 必须按超时返回，不能等 playwright 默认 30s
+  const t0 = Date.now();
+  const hung = await shot({ screenshot: () => new Promise(() => {}) }, out, { timeoutMs: 300 });
+  const dt = Date.now() - t0;
+  ok('截图挂死 → 按超时返回', hung.ok === false && dt < 3000, `耗时 ${dt}ms`);
+}
+
+// ═══ 9. lib/ledger.cjs 变体维度 ════════════════════════════════════
+section('lib/ledger.cjs 变体维度');
+{
+  const ledger = require('./lib/ledger.cjs');
+  const vCfg = { ROOT: tmp, load: () => ({ publish: { ledger: path.join(tmp, 'ledger-var.yaml') } }) };
+
+  // 图文线写一条 manual-handoff
+  ledger.setEntry(vCfg, { contentKey: 'v1', platform: 'douyin', variant: 'image', status: 'manual-handoff' });
+
+  // 视频线是**另一条**记录 → 不该被图文线的记录挡住
+  const vVideo = ledger.assertNotRepeated(vCfg, { contentKey: 'v1', platform: 'douyin', variant: 'video' });
+  ok('不同变体互不遮挡', vVideo.allowed === true, vVideo.reason);
+
+  // 同变体 → 挡住
+  let blocked = null;
+  try {
+    ledger.assertNotRepeated(vCfg, { contentKey: 'v1', platform: 'douyin', variant: 'image' });
+  } catch (e) {
+    blocked = e;
+  }
+  ok('同变体 → 闸门挡住', !!blocked);
+
+  // 旧格式台账（没有变体段）→ 新代码仍要能挡住
+  const oldCfg = { ROOT: tmp, load: () => ({ publish: { ledger: path.join(tmp, 'ledger-old.yaml') } }) };
+  fs.writeFileSync(
+    path.join(tmp, 'ledger-old.yaml'),
+    ['version: 1', 'entries:', '  - id: "old1#douyin"', '    platform: douyin',
+     '    status: "published"', '    url: ""', '    note: ""'].join('\n')
+  );
+  let oldBlocked = null;
+  try {
+    ledger.assertNotRepeated(oldCfg, { contentKey: 'old1', platform: 'douyin', variant: 'image' });
+  } catch (e) {
+    oldBlocked = e;
+  }
+  ok('旧格式台账条目仍能挡住（向后兼容）', !!oldBlocked);
+
+  // 指纹：同内容换 key 也要能认出来
+  ledger.setEntry(vCfg, { contentKey: 'v2', platform: 'weibo', variant: 'image', status: 'published' });
+  const fpHit = ledger.findEntry(ledger.read(vCfg), { contentKey: 'v2', platform: 'weibo', variant: 'image' });
+  ok('写回带内容指纹', !!(fpHit && fpHit.fingerprint));
+
+  // 旧台账记录带变体写回 → **不该多出一条重复记录**
+  const dupCfg = { ROOT: tmp, load: () => ({ publish: { ledger: path.join(tmp, 'ledger-dup.yaml') } }) };
+  fs.writeFileSync(
+    path.join(tmp, 'ledger-dup.yaml'),
+    ['version: 1', 'entries:', '  - id: "d1#douyin"', '    platform: douyin',
+     '    status: "published"', '    url: ""', '    note: ""'].join('\n')
+  );
+  ledger.setEntry(dupCfg, { contentKey: 'd1', platform: 'douyin', variant: 'image', status: 'published' });
+  const dupDoc = ledger.read(dupCfg);
+  ok('带变体写回旧记录 → 不产生重复条目', dupDoc.entries.length === 1, `实得 ${dupDoc.entries.length} 条`);
+  ok('旧记录的 id 被保留（不强行迁移）', dupDoc.entries[0].id === 'd1#douyin', dupDoc.entries[0].id);
+}
+
+// ═══ 10. lib/platform-urls.cjs 平台↔链接域名闸 ═══════════════════════
+section('lib/platform-urls.cjs');
+{
+  const urls = require('./lib/platform-urls.cjs');
+
+  ok('公众号链接属于公众号', urls.urlMatchesPlatform('https://mp.weixin.qq.com/s/abc', 'wechat') === true);
+  ok('视频号链接不属于公众号（靠路径区分）', urls.urlMatchesPlatform('https://weixin.qq.com/sph/abc', 'wechat') === false);
+  ok('视频号链接属于视频号', urls.urlMatchesPlatform('https://weixin.qq.com/sph/abc', 'shipinhao') === true);
+  ok('公众号链接不属于视频号', urls.urlMatchesPlatform('https://mp.weixin.qq.com/s/abc', 'shipinhao') === false);
+  ok('微博链接属于微博', urls.urlMatchesPlatform('https://weibo.com/3985205283/RouubauwR', 'weibo') === true);
+  ok('抖音笔记链接属于抖音', urls.urlMatchesPlatform('https://www.douyin.com/note/7700956323348843826', 'douyin') === true);
+  ok('抖音视频链接属于抖音', urls.urlMatchesPlatform('https://www.douyin.com/video/7700957685864320306', 'douyin') === true);
+  ok('知乎想法链接属于知乎', urls.urlMatchesPlatform('https://zhihu.com/pin/2098153840356995264', 'zhihu') === true);
+  ok('B站链接属于B站', urls.urlMatchesPlatform('https://www.bilibili.com/video/BV1CznZ6WEnL/', 'bilibili') === true);
+  ok('陌生域名一律拒写', urls.urlMatchesPlatform('https://example.com/x', 'douyin') === false);
+  ok('平台本身不在表里 → 不拦', urls.urlMatchesPlatform('https://example.com/x', 'someunknownplatform') === true);
+  ok('跨平台错位：视频号链接放进小红书 → 拒', urls.urlMatchesPlatform('https://weixin.qq.com/sph/abc', 'xiaohongshu') === false);
+
+  // 反查
+  ok('反查平台：视频号', urls.platformOfUrl('https://weixin.qq.com/sph/abc') === 'shipinhao');
+  ok('反查平台：公众号', urls.platformOfUrl('https://mp.weixin.qq.com/s/abc') === 'wechat');
+
+  // 抽链接
+  const got = urls.extractUrls('见 https://a.com/x 和 https://b.com/y。');
+  ok('抽取两条链接', got.length === 2, got.join(' | '));
+
+  // 轮换 token 判定
+  ok('视频号链接 → 轮换 token', urls.isRotatingTokenUrl('https://weixin.qq.com/sph/A4GAfOX6s') === true);
+  ok('B站 BV 号 → 稳定', urls.isRotatingTokenUrl('https://www.bilibili.com/video/BV1CznZ6WEnL/') === false);
+
+  // ⚠️ 禁核验：小红书**一个 HTTP 请求都不许发**
+  let calls = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (...a) => {
+    calls++;
+    return realFetch(...a);
+  };
+  const v = await urls.verifyUrl('https://www.xiaohongshu.com/explore/6adf4bc5000000001200c077');
+  globalThis.fetch = realFetch;
+  ok('小红书核验被跳过', v.skipped === true && v.ok === null);
+  ok('小红书核验零 HTTP 请求', calls === 0, `实发 ${calls} 次`);
+}
+
+// ═══ 11. lib/preflight.cjs 图集连续性 ══════════════════════════════
+section('lib/preflight.cjs 图集连续性');
+{
+  const { preflight } = require('./lib/preflight.cjs');
+
+  // 断号：01 02 04，声称 3 张 → 「在但序错」，必须 FAIL
+  const dirA = path.join(tmp, 'media-hole');
+  fs.mkdirSync(dirA, { recursive: true });
+  ['img-01.png', 'img-02.png', 'img-04.png'].forEach((f) => fs.writeFileSync(path.join(dirA, f), 'x'));
+  let holeErr = null;
+  try {
+    preflight({ platform: 'douyin', mediaDir: dirA, declaredCount: 3, limits: { titleMax: 30 } });
+  } catch (e) {
+    holeErr = e;
+  }
+  ok('图集断号 → FAIL', !!holeErr && /序号断了|缺序号/.test(holeErr.message));
+
+  // 不足：只有 2 张却声称 3 张 → FAIL（原来只是 WARN）
+  const dirB = path.join(tmp, 'media-short');
+  fs.mkdirSync(dirB, { recursive: true });
+  ['img-01.png', 'img-02.png'].forEach((f) => fs.writeFileSync(path.join(dirB, f), 'x'));
+  let shortErr = null;
+  try {
+    preflight({ platform: 'douyin', mediaDir: dirB, declaredCount: 3, limits: { titleMax: 30 } });
+  } catch (e) {
+    shortErr = e;
+  }
+  ok('图集张数不足 → FAIL（原来只是 WARN）', !!shortErr);
+
+  // 连续 → 通过
+  const dirC = path.join(tmp, 'media-ok');
+  fs.mkdirSync(dirC, { recursive: true });
+  ['img-01.png', 'img-02.png', 'img-03.png'].forEach((f) => fs.writeFileSync(path.join(dirC, f), 'x'));
+  let okErr = null;
+  try {
+    preflight({ platform: 'douyin', mediaDir: dirC, declaredCount: 3, limits: { titleMax: 30 } });
+  } catch (e) {
+    okErr = e;
+  }
+  ok('连续图集 → 通过', !okErr);
 }
 
 // ═══ 汇总 ══════════════════════════════════════════════════════════

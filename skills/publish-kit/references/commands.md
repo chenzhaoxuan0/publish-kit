@@ -43,10 +43,42 @@ node bin/publish-all.cjs --platforms douyin,weibo,zhihu,bilibili,shipinhao --kin
 ⚠️ **物料不全会秒级报错且不启动任何平台脚本**（编排器会并发起 N 个进程连你的浏览器，
 物料不全就别启动）。
 
+### 发布清单（各平台物料不同 → 用这个）
+
+```bash
+node bin/publish-manifest.cjs <清单.yaml>              # 真填单
+node bin/publish-manifest.cjs <清单.yaml> --dry-run    # 只打印将要跑什么
+node bin/publish-manifest.cjs <清单.yaml> --check-only # 只体检，不起浏览器
+node bin/publish-manifest.cjs <清单.yaml> --variants image --only douyin,zhihu
+node bin/publish-manifest.cjs <清单.yaml> --concurrency 5 --content-key "2026-10-26_x"
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--variants` | 只要这几个分发变体（逗号分隔） |
+| `--only` | 只要这几个平台（逗号分隔） |
+| `--dry-run` | 只打印命令，不执行 |
+| `--check-only` | 只做体检（清单校验 + 物料存在性） |
+| `--concurrency` | 并发上限，默认 5 |
+| `--content-key` | 防重复闸门用的内容标识（清单里写了 `content.key` 就用它） |
+| `--allow-repeat` | 显式允许重复（绕过台账闸门） |
+| `--no-retry` | 关闭失败自动重试 |
+
+清单字段全表见 `<publish-kit>/docs/manifest.example.yaml`。要点：
+
+- 槽位字段：`platform` `via` `kind` `title` `titleFile` `bodyFile` `media` `count`
+  `video` `cover` `covers[]` `tags`/`tagsFile` `options` `limits` `weight`
+  `exclusive` `releaseFile` `note`
+- **`via`**：`browser`（默认）/ `api`（公众号）/ `manual`（**零自动化，只备料**）
+- **`options`** 是平台专属开关，写表外的**直接报错**（不静默丢）：
+  抖音 `album`/`music`、微博 `channel`/`sub`/`no_declare`、
+  知乎 `field`/`title_in_body`、视频号 `album`/`location`
+- **路径相对清单文件所在目录**
+
 ### 自检
 
 ```bash
-node selftest.cjs              # 37 项：等待/日志/体检/台账/编排，不连浏览器
+node selftest.cjs              # 104 项：等待/日志/体检/台账/编排/清单/诊断/截图/链接闸，不连浏览器
 ```
 
 ---
@@ -129,6 +161,7 @@ node platforms/zhihu-pin.cjs --media <dir> --body-file <简介.txt> [--count 6]
 node platforms/wechat.cjs ip                        # 查当前公网出口 IP（家宽动态 IP 会变）
 node platforms/wechat.cjs check                     # 连通性检查（取 token，无写入）
 node platforms/wechat.cjs push --media <dir> --title "标题" [--body-file <f>] [--count N]
+node platforms/wechat.cjs verify --media-id <id>    # 只读核查草稿在不在（不新增素材）
 ```
 
 | 参数 | 说明 |
@@ -138,6 +171,25 @@ node platforms/wechat.cjs push --media <dir> --title "标题" [--body-file <f>] 
 | `--body-file` | 纯文本配文（≤1265 字符硬上限） |
 | `--count` | 取前 N 张 |
 | `--app-id` | 临时换一个 AppID（secret 仍取自配置） |
+| `--material-ids` | **复用已上传素材重建草稿**（不重新上传、不占新配额）。数量必须与要贴的图数一致，不一致直接报错 |
+| `--content-key` | 启用防重复闸门（**在上传任何素材之前**就拦） |
+| `--variant` | 台账变体（与编排层写回台账用的变体保持一致） |
+| `--allow-repeat` | 显式允许重复 |
+
+**push 成功后固定输出两行**（给编排层解析）：
+
+```
+MATERIAL_IDS: <逗号分隔>     # 本次用到的素材 media_id（上传完成即打）
+DRAFT_MEDIA_ID: <草稿 id>   # 草稿进箱后打
+```
+
+**verify 的退出码语义**（编排层要区分）：
+
+| 退出码 | 含义 | 该怎么办 |
+|---|---|---|
+| 0 | `DRAFT_VERIFY: ok media_id=… title=…` | 草稿在，一切正常 |
+| 1 | `DRAFT_VERIFY: not_found media_id=…` | 草稿**真的不在** → 用上面的 `MATERIAL_IDS` 重建 |
+| 2 | `DRAFT_VERIFY: error media_id=… reason=…` | **查不动**（凭证/接口问题）—— 当成 1 会误判成「草稿不在」→ 白重传素材、 白占配额 |
 
 **终点是草稿箱。** 个人主体账号的发布类 API 权限已被官方回收，脚本不碰那些接口。
 
@@ -145,6 +197,7 @@ node platforms/wechat.cjs push --media <dir> --title "标题" [--body-file <f>] 
 - `invalid ip`（errcode 40164）→ 本机 IP 不在白名单，**不是 bug**
 - 内容上限比看起来小：标题 32 / 正文 1265 / 20 张
 - 凭证三选一（优先级从高到低）：环境变量 `WECHAT_APP_ID`/`WECHAT_APP_SECRET` → `--app-id` → `config.yaml`
+- **公众号素材是永久素材** → 重跑 = 白占素材库配额（清理要去 mp 后台人工删）→ **API 通道永不自动重跑**
 
 ---
 
