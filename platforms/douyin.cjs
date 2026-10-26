@@ -223,6 +223,11 @@ function findUseButton(page, name) {
 
 async function selectMusic(page, name, tab = '收藏') {
   try {
+    // ⚠️ 2026-10-27 ego 实测补：先隐藏「发文助手」浮窗 —— 它弹出时会遮挡扩展信息区的
+    //    「选择音乐」入口坐标（fill 步开头隐藏过一次，转码/检测完成后可能再弹）。
+    await page
+      .evaluate(() => document.querySelectorAll('[class*="creator-help"]').forEach((el) => { el.style.display = 'none'; }))
+      .catch(() => {});
     // ① 入口（点 action 那个，不是行标题）
     const entry = await page.evaluate(() => {
       const cands = [];
@@ -489,7 +494,12 @@ async function kindOf(page) {
                   const pos = await page.evaluate(() => {
                     const el = [...document.querySelectorAll('div,span,label')].find((x) => {
                       const t = (x.textContent || '').trim();
-                      return /点击上传/.test(t) && /图片/.test(t) && x.children.length === 0;
+                      // ⚠️ 2026-10-27 ego 实测补：第 1 张传完后上传区进入「继续添加」态，
+                      //    原 file input 从 DOM 消失、入口文本也不再是「点击上传…图片」——
+                      //    只认旧文案会让第 2 张起全部失败（实测 1/6 残缺图集）。
+                      if (/点击上传/.test(t) && /图片/.test(t) && x.children.length === 0) return true;
+                      if (/^继续添加$/.test(t) && x.children.length === 0) return true;
+                      return false;
                     });
                     if (!el) return null;
                     const r = el.getBoundingClientRect();

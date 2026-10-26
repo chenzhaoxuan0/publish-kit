@@ -700,12 +700,13 @@ section('lib/driver.cjs + lib/drivers/ego.cjs');
   // ── ego 门面：假 taskSpace 全局 + 假 raw page ──
   // 假 evaluate 按「函数源码特征」分发出 canned 值（真机上是页面在跑，测试里是桩）
   function fakeRawPage({ url = 'https://creator.douyin.com/creator-micro/content/upload', alive = true } = {}) {
-    const calls = { screenshot: [], clicks: [], presses: [], fills: [], setInput: [], chooserFiles: [] };
+    const calls = { screenshot: [], clicks: [], presses: [], fills: [], setInput: [], chooserFiles: [], evalArgc: 0 };
     const raw = {
       __calls: calls,
       url: async () => url,
       title: async () => 't',
-      evaluate: async (fn, arg) => {
+      evaluate: async function (fn, arg) {
+        calls.evalArgc = arguments.length;
         const src = String(fn);
         if (/querySelectorAll\(q\)\.length/.test(src)) return 2; // resolveNth：多命中
         if (/getBoundingClientRect/.test(src) && arg && arg.q) return { x: 10, y: 20, bx: 1, by: 2, bw: 100, bh: 50 };
@@ -753,6 +754,11 @@ section('lib/driver.cjs + lib/drivers/ego.cjs');
   const chooser = await page.waitForEvent('filechooser', { timeout: 100 });
   await chooser.setFiles(['C:\\a\\img-01.png']);
   ok('waitForEvent(filechooser) 映射到 waitForFileChooser', raw.__calls.chooserFiles[0][0] === 'C:/a/img-01.png');
+
+  // 12b'. 零参 evaluate 不得携带 undefined 实参（ego 的 arguments.length 陷阱，
+  //       2026-10-27 bento-grids 实测抓到：显式 undefined → "must be JSON-serializable"）
+  await page.evaluate(() => 1);
+  ok('零参 evaluate 只传 1 个实参', raw.__calls.evalArgc === 1, `实得 ${raw.__calls.evalArgc}`);
 
   // 12c. keyboard.press 的大小写归一（Control+a → Control+A）
   await page.keyboard.press('Control+a');

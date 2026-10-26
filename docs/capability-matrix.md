@@ -223,10 +223,21 @@ variants:                            # 分发变体：同一份内容的不同�
 > - 抖音示范：bootstrap 换 driver 工厂、`page.url()`/`ctx.pages()` 异步化、`--force` 三形态归一；
 >   顺手修了存量 bug（`sleep()` 在 upload/cover 路径被裸调但从未定义 → ReferenceError）。
 > - 门面纯逻辑进 selftest（132 项全绿：死页自愈换名、接管被拒原样抛、截图剥 timeout 等）。
-> - **待真机验证**：`driver: ego` 下抖音 video + image 各一轮（终点 = 发布按钮前，人工点发布）。
->   真机通过前，抖音之外的平台**尚未迁移**（仍是 playwright-only）。
-> - 已知边界：`>48MB` ego 下不直传（明确报错转人工）；ego 的 `keyboard.type` 的 `delay`
->   选项未实测（若报 unknown option，门面剥掉即可，节奏由 waitForTimeout 保住）。
+> - **真机验证（2026-10-27 凌晨，aesthetic/2026-10-20_bento-grids 欠账补发实测）**：
+>   全链路 6 步（open→upload→fill→music→collect→shot+handoff）在 ego 通道跑通，
+>   表单 6/6 图 + 标题/正文/4 话题 chip + 合集「审美积累」+ 自主声明全部落位，停在发布按钮前。
+>   实测抓出并当场修掉 3 个通道缺陷：
+>   ① **spawn stdin 挂死** —— node spawn pwsh 默认 stdin pipe 时 ego-browser CLI 启动即僵死
+>     （CPU 0），`stdio: ['ignore','pipe','pipe']`（对齐 operation）解决；
+>   ② **可选项转发陷阱** —— ego 对显式 undefined 实参敏感（`evaluate(fn, undefined)` 报
+>     "must be JSON-serializable"），门面全部可选项改经 `fwd()`（剥尾部 undefined）转发；
+>   ③ **上传入口文案** —— 第 1 张传完后抖音上传区进入「继续添加」态，原 file input 消失，
+>     回退路径只认「点击上传…图片」导致 1/6 残缺图集；locateEntry 补「继续添加」匹配后 2/2 ✓。
+>   **已知遗留（fail-soft，不阻塞）**：配乐步紧跟 fill 之后偶发静默早退（单独跑/collect 后跑
+>   都稳定成功；失败时只 warn 不阻塞，人工补选 10 秒）；upload 偶发 5/6（复核判据 warn 级，
+>   截图目检兜底）。两项待下轮专项加固。
+>   另：ego lite 的 handOff 红线实测有效 —— 交还后的空间再碰即 hard stop，编排器按
+>   空间名变体（-r2/-r3）自愈开新空间，不接管用户空间。
 
 ### 给贡献者的一条硬规矩
 
