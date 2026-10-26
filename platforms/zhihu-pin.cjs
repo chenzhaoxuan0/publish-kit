@@ -40,9 +40,12 @@
 //      必须键盘输入触发 Draft 内部状态；直接设 innerHTML 不落 React state。
 //   ④ 遗留知乎标签页可能带旧草稿，交割护栏：全量 contenteditable >10 字即视为已交割。
 //   ⑤ .public-DraftEditor-content 常驻 DOM 但未激活时 getBoundingClientRect() = 0×0，
-//      不先点「分享此刻的想法…」进编辑态，click 会 30s 超时 invisible。
-//   ⑥ 编辑态下真正的发布按钮文案是「发布」，「发想法」是未激活态那个 0 宽的占位按钮（w:0）。
-//      别按「发想法」找。
+//      必须先进编辑态。⚠️ 2026-10-26 修正：**点 placeholder 文字元素（「分享此刻的想法…」）
+//      在当前 UI 上已完全失效**——它匹配到的是外层容器 DIV，点它不激活编辑器（恒 0 宽）；
+//      可靠入口 = 正文区文案恰为「发想法」的**按钮**（BUTTON 75×32），
+//      且第一次点击有概率落空 → **最多重试 3 次**（无人值守不能靠人重跑）。
+//   ⑥ 编辑态下真正的发布按钮文案是「发布」（「发想法」在编辑态下会收成 0 宽占位）；
+//      但**激活编辑器**要找「发想法」按钮——两者不矛盾：**入口找「发想法」，发布找「发布」**。
 //   ⑦ **知乎想法的图不在 Draft.js 编辑器容器里**。上传成功后图落在编辑器**上方**的
 //      独立图集区：div.DraggableTags > .DraggableTags-tag > img（src 是
 //      pic-private.zhihu.com，草稿态私有 CDN，natural 尺寸=原图，如 1440x1920）。
@@ -216,43 +219,78 @@ function matchStripToSources(items, srcDims) {
   if (!loggedIn) throw new Error('知乎未登录或未加载完成（无「发想法」按钮）: ' + p.url());
   console.log('知乎创作中心已开:', p.url(), '✓ 登录态正常');
 
-  // 0) 激活想法编辑器（坑位⑤）：.public-DraftEditor-content 常驻 DOM 但
-  //    未激活时 getBoundingClientRect() = 0×0，click 会 30s 超时 invisible。
-  //    必须先点「分享此刻的想法…」进入编辑态，编辑器才展开有尺寸。
-  const activated = await p.evaluate(() => {
-    const ed = document.querySelector('.public-DraftEditor-content');
-    if (ed && ed.getBoundingClientRect().width > 0) return { alreadyOpen: true };
-    const cands = Array.from(document.querySelectorAll('div,span,button,a'));
-    // 2026-10-21 修：优先精确文本命中占位符本体。
-    // 原逻辑按 DOM 顺序取第一个匹配，会先命中「分享此刻的想法...同步到圈子发想法」这个**容器**，
-    // 其几何中心落在两段文字之间的空隙 → 点了没反应 → 编辑器 0 宽报错。
-    // 改为两轮：① 精确文本（占位符本体）；② 才退回宽松正则（兼容改版后的其他文案）。
-    const pick = (pred) => {
-      for (const el of cands) {
+  // 0) 激活想法编辑器（坑位⑤）
+  // ⚠️ 2026-10-26 实测修正（移植自 ego 通道 04_skills/ego-publish/platforms/zhihu.mjs，
+  //    那边 2026-10-20 就已定位、2026-10-22 补了重试；本仓库漏同步 → B 通道在当前
+  //    知乎 UI 上**恒 0 宽直接 FATAL**，降级等于白跑）：
+  //    「点 placeholder 文字元素」这条路在**当前的知乎页面上已完全失效**——
+  //    「分享此刻的想法...同步到圈子发想法」只是一段 placeholder 文本，
+  //    匹配到的是外层容器 DIV，点它**不激活编辑器**（编辑器保持 0×0）。
+  //    **可靠入口是正文区那个文案恰为「发想法」的按钮**（BUTTON，75×32）。
+  // ⚠️ 第一次点击**有概率不生效**（页面状态残留时点击落空）→ **最多重试 3 次**，
+  //    每次都重新探测入口 —— 无人值守的夜间任务不能靠人重跑一次。
+  let editorWidth = 0;
+  for (let attempt = 1; attempt <= 3 && editorWidth === 0; attempt++) {
+    const activated = await p.evaluate(() => {
+      // 已展开就别再点（点「发想法」会把已开的编辑器收起来）
+      const ed0 = document.querySelector('.public-DraftEditor-content, [contenteditable="true"]');
+      if (ed0 && ed0.getBoundingClientRect().width > 0) return { alreadyOpen: true };
+      // 优先：文案恰为「发想法」的按钮
+      for (const el of document.querySelectorAll('button')) {
+        if ((el.textContent || '').trim() === '发想法' && el.getBoundingClientRect().width > 0) {
+          const r = el.getBoundingClientRect();
+          return { x: r.x + r.width / 2, y: r.y + r.height / 2, tag: el.tagName, how: '发想法按钮' };
+        }
+      }
+      // 兜底：placeholder 文字元素（老版页面）
+      for (const el of document.querySelectorAll('div,span,button,a')) {
         const t = (el.textContent || '').trim();
-        if (!pred(t)) continue;
-        const r = el.getBoundingClientRect();
-        if (r.width > 20 && r.height > 5) return { x: r.x + r.width / 2, y: r.y + r.height / 2, tag: el.tagName, t };
+        if (t === '分享此刻的想法...' || t === '分享此刻的想法…' || (t.length > 4 && t.length < 20 && /分享此刻的想法/.test(t))) {
+          const r = el.getBoundingClientRect();
+          if (r.width > 20 && r.height > 5) {
+            return { x: r.x + r.width / 2, y: r.y + r.height / 2, tag: el.tagName, how: 'placeholder文字' };
+          }
+        }
       }
       return null;
-    };
-    return pick(t => t === '分享此刻的想法...' || t === '分享此刻的想法…')
-      || pick(t => t.length > 4 && t.length < 20 && /分享此刻的想法/.test(t));
-  });
-  if (activated && activated.alreadyOpen) console.log('想法编辑器已处于编辑态');
-  else if (activated) {
-    console.log('点「分享此刻的想法…」激活编辑器:', JSON.stringify(activated));
+    });
+
+    if (activated && activated.alreadyOpen) {
+      console.log('想法编辑器已处于编辑态');
+      editorWidth = 1;
+      break;
+    }
+    if (!activated) {
+      console.log(`第 ${attempt} 次没找到「发想法」入口，重试`);
+      await sleep(1200);
+      continue;
+    }
+    console.log(`激活编辑器（${activated.how}）:`, JSON.stringify(activated));
     await p.mouse.click(activated.x, activated.y);
     await sleep(2500);
-  } else throw new Error('未找到「分享此刻的想法…」入口，编辑器无法激活（页面改版？）');
+    const w = await p.evaluate(() => {
+      const ed = document.querySelector('.public-DraftEditor-content, [contenteditable="true"]');
+      return ed ? Math.round(ed.getBoundingClientRect().width) : 0;
+    });
+    if (w > 0) { editorWidth = w; break; }
+    console.log(`第 ${attempt} 次点击没让编辑器展开（仍 0 宽），重试`);
+    await sleep(1200);
+  }
+
+  if (editorWidth === 0) {
+    throw new Error(
+      '想法编辑器连点 3 次都没展开（0 宽），未能进入编辑态。\n' +
+      '  已尝试「发想法」按钮与 placeholder 文字两种入口。\n' +
+      '  请人工在 CDP Chrome 里点一下「发想法」看能否展开，再决定要不要改选择器。'
+    );
+  }
   // 验证编辑器已展开
   const edOpen = await p.evaluate(() => {
-    const ed = document.querySelector('.public-DraftEditor-content');
+    const ed = document.querySelector('.public-DraftEditor-content, [contenteditable="true"]');
     const r = ed ? ed.getBoundingClientRect() : { width: 0, height: 0 };
     return { w: Math.round(r.width), h: Math.round(r.height) };
   });
   console.log('编辑器尺寸:', JSON.stringify(edOpen));
-  if (edOpen.w === 0) throw new Error('想法编辑器激活后仍为 0 宽，未能进入编辑态');
 
   // 0.5) 标题落「标题」字段（坑位⑨）
   //     想法 V2 表单里 TitleArea > textarea[name="title"]，maxLength=-1（非必填）。

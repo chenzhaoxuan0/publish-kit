@@ -143,7 +143,7 @@ async function main() {
   const port = (cdp.match(/:(\d+)/) || [])[1];
   let info = await cdpInfo(cdp);
   if (!info && chrome && !problems.includes('chrome') && !NO_LAUNCH) {
-    console.log(warn('CDP 未在线，正在拉起浏览器…'));
+    console.log(warn('CDP 未在线，正在拉起浏览器…（**可见窗口，会占用户桌面**）'));
     try {
       launchChrome(chrome, profile, port);
       for (let i = 0; i < 12; i++) {
@@ -217,6 +217,26 @@ async function main() {
   }
 
   // ── 汇总 ────────────────────────────────────────────────
+  // ⚠️ CDP Chrome 生命周期提示（2026-10-26 加）：
+  //    本命令拉起的 CDP Chrome 是 **headed 可见窗口**（会占用户桌面），
+  //    而且**它退出后是否还活着没有保证**（用户可能随手关掉，或进程自己退）。
+  //    10-26 实测踩坑：doctor 拉起 → 2 分钟后端口已不通（ECONNREFUSED）
+  //    → agent 以为「要再拉一次」→ **又弹一次窗**。所以这里退出前**复核一次**，
+  //    把状态说清楚，避免重复拉起。
+  if (!NO_LAUNCH) {
+    const alive = await cdpInfo(cdp);
+    if (alive) {
+      console.log(`\n${C.dim}CDP Chrome 生命周期：本命令拉起的浏览器**仍在后台运行**（${cdp}）——`
+        + `后续 B 通道脚本可直接连，**不要重复拉起**（再拉会弹第二个窗口）。`
+        + `用完可关掉它。${C.reset}`);
+    } else if (chrome) {
+      console.log(`\n${C.yellow}CDP Chrome 生命周期：浏览器**已不在**（${cdp} 不通）——`
+        + `多半是它已被关掉或已退出。${C.reset}`);
+      console.log(`${C.yellow}  下次要连 CDP 时**只拉一次**（本命令会自动拉，或手动跑 launch-cdp-chrome.cmd），`
+        + `别连着拉两次——每拉一次都会弹一个可见窗口。${C.reset}`);
+    }
+  }
+
   console.log('\n' + '─'.repeat(60));
   if (!problems.length) {
     console.log(`${C.green}${C.bold}环境就绪。${C.reset}`);

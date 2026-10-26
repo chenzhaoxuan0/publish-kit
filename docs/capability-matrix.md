@@ -159,6 +159,8 @@ publish-kit（Playwright）与 content 工作区（ego lite）是**独立仓库�
 | 能力 | publish-kit | content/ego-publish | 一致？ |
 |---|---|---|---|
 | 抖音话题单轮法 | ✅ `platforms/douyin.cjs` | ✅ `lib/douyin-topics.mjs` | ✅ |
+| **知乎想法编辑器入口** | ✅ `platforms/zhihu-pin.cjs`（2026-10-26 重写：点「发想法」BUTTON + placeholder 兜底 + 最多重试 3 次） | ✅ `platforms/zhihu.mjs`（2026-10-20 定位、10-22 补重试） | ✅ **2026-10-26 补同步**（此前 ego 侧早已注明本仓库这条路子失效，本仓库未同步 → B 通道在当前 UI 上恒 0 宽 FATAL） |
+| **知乎传图策略** | ✅ **一张一张插**（每张独立走三层 UI + 「图集区计数必须 +1」判据 + 3 次重试） | ✅ 一次传 N 张 + blob≥N×2 判据（2026-10-26 修计数滞后） | ⚠️ **实现不同、行为等价**（本仓库逐张插没有「批量点选被裁切」与「计数滞后」两个坑） |
 | 抖音配乐 | ✅ `douyin.cjs music` 子命令 | ✅ `lib/douyin-music.mjs` | ✅ |
 | 抖音封面模式判据（step-active） | ✅ | ✅ | ✅ |
 | 抖音图文逐张传 + 数实际缩略图 | ✅ | ✅ | ✅ |
