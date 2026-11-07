@@ -26,7 +26,9 @@
 //    提醒你人工去发（零自动化是账号级决策，工具不该替你破例）。
 
 const path = require('path');
+const { spawnSync } = require('child_process');
 const cfg = require('../lib/config.cjs');
+const driver = require('../lib/driver.cjs');
 const manifest = require('../lib/manifest.cjs');
 const { publishSlots, formatResults } = require('../lib/publish-all.cjs');
 
@@ -143,6 +145,26 @@ function parseArgs(argv) {
 
   const contentKey = args['content-key'] && args['content-key'] !== true ? String(args['content-key']) : plan.content.key;
 
+  // ── 填单前：ego 窗口恢复（2026-11-01 生产环境实测的「最小化 → 填单集体假死」）──
+  //   截图报 minimized、fill/mouse 超时、filechooser 不 fire、选择器读不到 —— 四种症状
+  //   一个根因。幂等：没窗口就跳过；失败不阻断填单（顶多退回原来的失败模式）。
+  const hasBrowserSlots = runnable.some((s) => s.via !== 'api');
+  if (hasBrowserSlots && driver.configuredChannel() === 'ego' && process.platform === 'win32') {
+    try {
+      const restore = spawnSync(
+        'pwsh',
+        ['-NoProfile', '-File', path.join(cfg.ROOT, 'bin', 'ego-window-restore.ps1')],
+        { stdio: 'ignore', timeout: 15000 }
+      );
+      if (restore.status === 0) {
+        console.log('  ↻ ego lite 窗口已恢复可见（防「窗口最小化 → 填单集体假死」）');
+      }
+      // status 2 = 没有 ego 进程（本机没装/没开）——静默跳过
+    } catch {
+      /* 恢复失败不阻断 */
+    }
+  }
+
   const result = await publishSlots(runnable, {
     concurrency: args.concurrency ? Number(args.concurrency) : 5,
     contentKey,
@@ -160,6 +182,8 @@ function parseArgs(argv) {
         console.log(`    · ${e.label}`);
       } else if (e.type === 'retry') {
         console.log(`  ↻ ${e.platform} 的「${e.label}」重试一次`);
+      } else if (e.type === 'skipped') {
+        console.log(`  ⏭ ${e.platform}：台账已是 ${e.status}，跳过（断点续跑）`);
       } else if (e.type === 'done') {
         console.log(`  ${e.ok ? '✓' : '✗'} ${e.platform} 结束（${(e.ms / 1000).toFixed(1)}s）`);
       }
@@ -168,8 +192,37 @@ function parseArgs(argv) {
 
   console.log(formatResults(result));
   const failed = result.results.filter((r) => !r.ok);
+
+  // ── 失败后：跑一次通道探针，分辨「环境坏了」还是「平台坏了」──────────
+  //   只探测不填单；探针本身不可用（exit 2）也如实报告，不猜。
+  const browserFailed = failed.filter((r) => r.ok === false && !r.skipped);
+  if (browserFailed.length) {
+    console.log('\n  ── 失败诊断：跑一次通道探针（只探测，不填单）──');
+    let probe = { status: -1, stdout: '' };
+    try {
+      probe = spawnSync(process.execPath, [path.join(cfg.ROOT, 'bin', 'channel-probe.cjs')], {
+        cwd: cfg.ROOT,
+        encoding: 'utf8',
+        timeout: 90000,
+      });
+    } catch (e) {
+      probe.stdout = String(e.message);
+    }
+    const out = `${probe.stdout || ''}`;
+    const line = out.match(/CHANNEL_PROBE:.*/)?.[0] || '（探针没有输出）';
+    console.log(`     ${line}`);
+    if (/nav=ok/.test(line) && /eval=ok/.test(line) && !/shot=ok/.test(line)) {
+      console.log('     判定：**只有截图坏了** → 填单判据全在 DOM，不影响填单 → 可以直接重跑。');
+    } else if (!/nav=ok/.test(line) || probe.status === 2) {
+      console.log('     判定：**通道整体不可用** → 先修环境（浏览器/CDP/ego lite/登录态），别再重跑。');
+    } else {
+      console.log('     判定：通道本身是通的 → 失败多半是平台侧（登录态/入口改版），看上面的具体报错。');
+    }
+    console.log(`     受影响槽位：${browserFailed.map((r) => r.label || r.platform).join('、')}`);
+  }
+
   if (failed.length) {
-    console.log(`⚠ ${failed.length} 个平台失败：${failed.map((f) => f.platform).join(', ')}\n`);
+    console.log(`\n⚠ ${failed.length} 个平台失败：${failed.map((f) => f.platform).join(', ')}\n`);
   }
   if (manual.length) {
     console.log(`⚠ ${manual.length} 个槽位待人工发布：${manual.map((m) => m.label || m.platform).join(', ')}\n`);

@@ -910,6 +910,17 @@ section('lib/result-file.cjs + 编排纯函数');
   ok('断点续跑：manual 槽位不查闸门', parts.runnable.some((s) => s.platform === 'xiaohongshu'));
   ok('断点续跑：allowRepeat 时全放行', pa.partitionRepeatedSlots([mkSlot('douyin', 'browser')], { contentKey: 'k', allowRepeat: true }, fakeLedger).runnable.length === 1);
   ok('断点续跑：没配 contentKey 时不拦', pa.partitionRepeatedSlots([mkSlot('douyin', 'browser')], {}, fakeLedger).runnable.length === 1);
+
+  // ── 泳道划分：同平台串成一条泳道，顺序保持 ──
+  const lanes = pa.toLanes([
+    { platform: 'douyin', kind: 'image' },
+    { platform: 'weibo', kind: 'video' },
+    { platform: 'douyin', kind: 'video' },
+    { platform: 'zhihu', kind: 'image' },
+  ]);
+  ok('泳道：同平台归一条泳道', lanes.length === 3);
+  ok('泳道：泳道内顺序保持（同平台两线串行）', lanes[0].map((s) => s.kind).join(',') === 'image,video');
+  ok('泳道：泳道间按首次出现排序', lanes.map((l) => l[0].platform).join(',') === 'douyin,weibo,zhihu');
 }
 
 // ═══ 汇总 ══════════════════════════════════════════════════════════
