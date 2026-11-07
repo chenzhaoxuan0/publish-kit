@@ -423,60 +423,36 @@ function matchStripToSources(items, srcDims) {
       const chooser = await pickFileWithRetry(p, locateLocal, { attempts: 3, timeout: 10000, step: 'zhihu-pin' });
       await chooser.setFiles([file]);
 
-      // 等预览 blob 出现（Modal 上限 18 张；这里只上传 1 张）
-      let ready = false, blobN = 0;
-      for (let i = 0; i < 15; i++) {
+      // 等上传完成（⚠️ blob ≠ 上传完成 —— 生产库 2026-10-26 实测：blob 预览是**本地**的
+      //   （每张渲染两层 blob），CDN 还没传完就点「插入图片」会掉图（实测 4/6、5/6）。
+      //   → 必须等 Modal 底部「已上传 N 张图片」计数出现才算传完，才算 ready）
+      let ready = false, blobN = 0, uploadedN = 0;
+      for (let i = 0; i < 20; i++) {
         await sleep(1500);
         const st = await p.evaluate(() => {
           const modal = document.querySelector('.Modal');
-          if (!modal) return { blobs: 0, hasInsert: false };
+          if (!modal) return { blobs: 0, hasInsert: false, uploaded: 0 };
           const seen = new Set();
           for (const im of modal.querySelectorAll('img')) {
             const src = im.currentSrc || im.src || '';
             if (src.startsWith('blob:')) seen.add(src);
           }
           const hasInsert = [...modal.querySelectorAll('button')].some((b) => (b.textContent || '').trim() === '插入图片' && b.getBoundingClientRect().width > 0);
-          return { blobs: seen.size, hasInsert };
+          const mUp = (modal.textContent || '').match(/已上传\s*(\d+)\s*张图片/);
+          return { blobs: seen.size, hasInsert, uploaded: mUp ? parseInt(mUp[1], 10) : 0 };
         }).catch(() => null);
         if (!st) continue;
         blobN = st.blobs;
-        if (st.blobs >= 1 && st.hasInsert) { ready = true; break; }
+        uploadedN = st.uploaded;
+        if (st.blobs >= 1 && st.hasInsert && st.uploaded >= 1) { ready = true; break; }
       }
-      if (!ready) throw new Error('单张图片未在 30s 内进入 Modal 预览');
+      if (!ready) throw new Error(`单张图片未在 30s 内完成上传（blob=${blobN}，已上传计数=${uploadedN}）`);
 
-      // 点选预览：取**最后一个**唯一 blob（Modal 若保留了上轮文件，新传的在末尾）
-      const pt = await p.evaluate(() => {
-        const modal = document.querySelector('.Modal');
-        if (!modal) return null;
-        const seen = new Set();
-        let last = null;
-        for (const im of modal.querySelectorAll('img')) {
-          const src = im.currentSrc || im.src || '';
-          if (!src.startsWith('blob:') || seen.has(src)) continue;
-          seen.add(src);
-          last = im;
-        }
-        if (!last) return null;
-        last.scrollIntoView({ block: 'center' });
-        const r = last.getBoundingClientRect();
-        if (r.width < 10) return null;
-        // 取「预览 ∩ 滚动容器可见区」的交集中心，避免点到被裁切掉的区域
-        let cont = last.parentElement, cr = null;
-        while (cont && cont !== document.body) {
-          const s = getComputedStyle(cont);
-          if (/auto|scroll/.test(s.overflowY + s.overflowX)) { cr = cont.getBoundingClientRect(); break; }
-          cont = cont.parentElement;
-        }
-        const vr = { top: 0, bottom: window.innerHeight, left: 0, right: window.innerWidth };
-        const box = cr || vr;
-        const top = Math.max(box.top, r.top, vr.top), bottom = Math.min(box.bottom, r.bottom, vr.bottom);
-        const left = Math.max(box.left, r.left, vr.left), right = Math.min(box.right, r.right, vr.right);
-        if (bottom - top < 8 || right - left < 8) return { x: r.x + r.width / 2, y: r.y + r.height / 2, clipped: true };
-        return { x: (left + right) / 2, y: (top + bottom) / 2, clipped: false };
-      }).catch(() => null);
-      if (!pt) throw new Error('Modal 内未找到可点选的预览图');
-      await p.mouse.click(pt.x, pt.y);
-      await sleep(800);
+      // ⚠️ **不点选预览**（2026-10-26 生产库实测推翻了本仓库旧的「逐张点选」流程）：
+      //   本地图片上传后的预览**已自动选中**（Modal 底部「已上传 N 张图片」计数可见），
+      //   再点一遍等于把自动选中态 toggle 掉 —— 实测只落 5/6 张；
+      //   不点选直接点「插入图片」→ 全部落位。旧结论（点最后一个唯一 blob）已废弃，
+      //   保留在此防止将来又被「看起来更稳」的点选方案带回去。
 
       const insPos = await p.evaluate(() => {
         const el = [...document.querySelectorAll('.Modal button, .Modal-inner button')]

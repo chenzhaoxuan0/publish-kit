@@ -1008,6 +1008,13 @@ section('lib/guard.cjs + preflight 内置扫描');
   );
   ok('specChars：微博双井号标签行同样剔除', pf.specChars('微博正文\n#话题A# #话题B#') === 4);
 
+  // ── toPlainContent：去 markdown 标题标记、不碰话题行 ──
+  ok(
+    'toPlainContent：去标题行首井号，不误伤 #话题 标签行',
+    guard.toPlainContent('# 站名：是什么网站\n正文一段\n#话题A #话题B#') === '站名：是什么网站\n正文一段\n#话题A #话题B#'
+  );
+  ok('toPlainContent：多级标题同样剥离', guard.toPlainContent('## 小标题\n内容') === '小标题\n内容');
+
   async function expectThrows(name, fn) {
     try {
       await fn();

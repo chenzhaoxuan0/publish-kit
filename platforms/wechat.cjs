@@ -16,11 +16,13 @@
  * 用法：
  *   node platforms/wechat.cjs ip                    # 查当前公网出口 IP，与上次记录比对；变化即提示去后台改白名单（不取 token、不依赖凭证）
  *   node platforms/wechat.cjs check                 # 连通性检查（先比对出口 IP，再取 token，无写入）
+ *   node platforms/wechat.cjs list                  # 列草稿箱前 10 条（只读；核对「推了但没记台账」的草稿）
  *   node platforms/wechat.cjs verify --media-id <草稿 media_id>
- *                    # **只读**核查：这条草稿到底在不在草稿箱里（只调 draft/get / draft/batchget，不碰任何写入接口）
+ *
  *   node platforms/wechat.cjs push --media <图片目录> --title "<标题 ≤32 字>"
  *                    [--body-file <纯文本正文>] [--count N] [--app-id <appId>]
  *                    [--material-ids "<id1,id2,...>"] [--content-key <key>] [--variant <v>] [--allow-repeat]
+ *                    [--dry-run] [--raw-content]
  *
  * verify 的机器可读输出（编排层按这一行 + 退出码判断，**别改格式**）：
  *   DRAFT_VERIFY: ok media_id=<id> title=<标题>      退出码 0  → 草稿在
@@ -65,6 +67,7 @@ const fs = require('fs');
 const path = require('path');
 const cfg = require('../lib/config.cjs');
 const ledger = require('../lib/ledger.cjs');
+const { toPlainContent } = require('../lib/guard.cjs');
 
 const API = 'https://api.weixin.qq.com';
 const TITLE_MAX = 32; // newspic 标题上限（微信平台限制，官方：总长度不超过32个字）
@@ -133,7 +136,10 @@ function finish(code) {
 }
 
 // 布尔开关：不吃下一个参数（`--allow-repeat` 后面跟的是别的参数，不能被吞掉）
-const BOOL_FLAGS = new Set(['allow-repeat']);
+// ⚠️ 新增无值 flag 必须登记进这里（生产库 2026-10-20 实测坑：无值 flag 按
+//   「key+下一 token」解析会把下一个参数吞成它的值 → 「以为在 dry-run，
+//   实际把草稿真推上去了」—— dry-run 类 flag 吞参是事故级 bug）。
+const BOOL_FLAGS = new Set(['allow-repeat', 'dry-run', 'raw-content']);
 
 function parseArgs(argv) {
   const args = { _: [] };
@@ -438,6 +444,29 @@ async function main() {
   // 在 Windows 上触发 libuv 断言把退出码污染成 0xC0000409（实测复现）。
   if (cmd === 'check') { ok('token 获取成功，API 通道可用。'); finish(0); return; }
 
+  // list 子命令（**只读**）：列草稿箱前 10 条 —— 核对「推了但没记台账」的草稿用，
+  // 不碰任何上传/写入接口。
+  if (cmd === 'list') {
+    const res = await fetch(`${API}/cgi-bin/draft/batchget?access_token=${token}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ offset: 0, count: 10, no_content: 1 }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const j = await res.json();
+    if (j.errcode) { console.error(`draft/batchget 失败：${JSON.stringify(j)}`); finish(1); return; }
+    const items = Array.isArray(j.item) ? j.item : [];
+    console.log(`草稿箱共 ${j.total_count ?? '?'} 条，显示前 ${items.length} 条：`);
+    for (const it of items) {
+      const id = it.media_id || it.item_id || '';
+      const first = (it.content && Array.isArray(it.content.items) && it.content.items[0]) || {};
+      const when = it.update_time ? new Date(it.update_time * 1000).toISOString().slice(0, 16).replace('T', ' ') : '????-??-?? ??:??';
+      console.log(`  · ${when}  ${(first.title || '').trim() || '（无标题）'}  ${id}`);
+    }
+    finish(0);
+    return;
+  }
+
   const title = args.title || '';
   if (!title) fail('缺少 --title（newspic 标题必填，≤32 字）');
   if ([...title].length > TITLE_MAX) fail(`标题 ${[...title].length} 字超过 newspic 上限 ${TITLE_MAX} 字：${title}`);
@@ -445,11 +474,33 @@ async function main() {
   let content = '';
   if (args['body-file']) {
     content = fs.readFileSync(args['body-file'], 'utf8').trim();
+    // 默认去 markdown 标题标记（newspic content 是**纯文本**配文 —— 上游的
+    // `## 小标题` 会原样显示成「## 它是什么」）。只去「行首井号+空白」，不碰
+    // #话题 标签行（井号后没空格的才是标签）。--raw-content 可关（原样透传）。
+    if (!args['raw-content']) {
+      const before = [...content].length;
+      content = toPlainContent(content);
+      if ([...content].length !== before) {
+        console.log(`已去除 markdown 标题标记（${before} → ${[...content].length} 字符；--raw-content 可关）`);
+      }
+    }
     if ([...content].length > BODY_MAX) fail(`正文 ${[...content].length} 字符超过 content 硬上限 ${BODY_MAX}。`);
     if ([...content].length > BODY_WARN) console.warn(`⚠ 正文 ${[...content].length} 字符超过建议值 ${BODY_WARN}，贴图配文宜短。`);
     // 物料守卫：推草稿是 API 通道的"准交付"动作，正文含 undefined/NaN 一律拒绝
     // ——曾有上游生成脚本的 bug 把「undefined。」推进已发布文章，返工需删稿重发
     if (/undefined|NaN|\[object Object\]/.test(content)) fail('[物料守卫] body-file 含 undefined/NaN，疑似上游生成 bug：先修文件再推送');
+  }
+
+  // --dry-run：只打印将要做什么，**不调任何写接口**（上传/建草稿都不碰）。
+  if (args['dry-run']) {
+    console.log('—— dry-run：只打印，不调任何写接口 ——');
+    console.log(`title（${[...title].length} 字）: ${title}`);
+    console.log(`content（${[...content].length} 字符）: ${content.slice(0, 120)}${content.length > 120 ? '…' : ''}`);
+    console.log(`media: ${args.media || '（未传）'} / count: ${args.count || '（默认）'}`);
+    console.log(`material-ids 复用: ${parseMaterialIds(args['material-ids']).join(',') || '无'}`);
+    console.log(`content-key: ${oneLine(args['content-key']) || '（未传，防重复闸门不生效）'}`);
+    finish(0);
+    return;
   }
 
   // ── ⚠️ 防重复闸门（2026-10-26 内化）：**上传任何素材之前** ──────────

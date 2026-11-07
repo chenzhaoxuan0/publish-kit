@@ -221,11 +221,46 @@ function locateUploadTrigger(p, inputSel, hintRe, acceptRe) {
       console.log('视频号壳首页已打开');
     }
     const url = p0.url();
+    // 登录判据（2026-10-27 生产库加固，坑位②）：**URL 只能判「未登录」，不能判
+    // 「已登录」** —— 老判据（纯 URL 不含 login）把已登录误报成 logged-out、白等用户
+    // 扫码。壳层「真实登录后痕迹」：『视频号ID』『关注者』『视频号 · 助手』。
+    // ⚠️ 正则要容忍分隔符：/视频号\s*[·・]?\s*助手/ —— 写死「视频号助手」永不命中。
+    //   壳层没命中再穿透 shadowRoot；页面异步渲染，判据要**轮询等 12 秒**。
+    const shellLoggedIn = async () => {
+      for (let i = 0; i < 8; i++) {
+        const hit = await p0.evaluate(() => {
+          const t = document.body ? document.body.innerText || '' : '';
+          if (/视频号ID|关注者/.test(t)) return 'shell';
+          if (/视频号\s*[·・]?\s*助手/.test(t)) return 'shell';
+          // 穿透 shadowRoot（视频号是微前端 + shadow DOM）
+          const walk = (root) => {
+            for (const el of root.querySelectorAll('*')) {
+              if (el.shadowRoot) {
+                const st = el.shadowRoot.textContent || '';
+                if (/视频号ID|关注者|视频号\s*[·・]?\s*助手/.test(st)) return true;
+                if (walk(el.shadowRoot)) return true;
+              }
+            }
+            return false;
+          };
+          if (walk(document)) return 'shadow';
+          return '';
+        }).catch(() => '');
+        if (hit) return hit;
+        await sleep(1500);
+      }
+      return '';
+    };
     if (/login/.test(url)) {
       console.log('⏳ 当前跳在登录页（' + url.slice(0, 80) + '）：请在页面里扫码登录视频号');
       console.log('   登录完成后继续其他平台流程；视频号上传填单按约定放在全平台最后执行');
     } else {
-      console.log('✅ 登录态正常（未跳 login），后续无需再扫码；视频号上传填单按约定放在全平台最后执行');
+      const hit = await shellLoggedIn();
+      console.log(
+        hit
+          ? `✅ 登录态正常（壳层痕迹 ${hit} 命中），后续无需再扫码；视频号上传填单按约定放在全平台最后执行`
+          : '⚠ 页面没跳 login 但壳层也没读到登录痕迹（12s 轮询）—— 可能未登录或渲染慢，请人工看一眼再继续'
+      );
     }
     await p0.screenshot({ path: SHOT }).catch(() => {});
     // 刻意不调 browser.close()。patchright 类型文档对 CDP 连接下的 close() 描述自相矛盾
@@ -427,7 +462,16 @@ function locateUploadTrigger(p, inputSel, hintRe, acceptRe) {
     await sleep(500);
     await p.mouse.click(eb.x + eb.width / 2, eb.y + eb.height / 2);
     console.log('封面「编辑」已点');
-    await sleep(3000);
+    // ⚠️ 2026-10-27 生产库（坑位⑲）：点「编辑」后弹窗**未挂载** —— 立刻找「上传封面」
+    //   会扑空，连带 CDP 兜底报「DOM.querySelector 没找到 cover」。→ 条件等
+    //   input[type=file][accept*=image] 出现再定位（替代固定 sleep(3000)）。
+    let coverDialogReady = false;
+    for (let i = 0; i < 10; i++) {
+      coverDialogReady = await p.locator('input[type=file][accept*="image"]')
+        .first().waitFor({ state: 'attached', timeout: 2000 }).then(() => true).catch(() => false);
+      if (coverDialogReady) break;
+    }
+    if (!coverDialogReady) console.warn('⚠ 封面弹窗 20s 内未见图片 input（未挂载？）—— 按原路径继续，失败转人工');
     // 5.5b) 弹窗「编辑封面」→ 图片 input（accept 含 image）
     //     2026-10-22（坑位⑰）：同视频上传 —— 直接塞 input 不触发 UI 上传逻辑，
     //     改成点 input 的**可见祖先**（实测 div.single-cover-uploader-wrap，文案「上传封面」）

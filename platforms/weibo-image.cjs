@@ -64,7 +64,7 @@ const { preflight, listImages } = require('../lib/preflight.cjs');
 // 2026-10-26 内化：截图留档层——截图失败只告警，不参与成败判据
 const { shot } = require('../lib/shot.cjs');
 // 护栏三件套（fillGuard/materialGuard/closeStalePages）集中实现，跨通道兼容
-const { fillGuard, materialGuard, closeStalePages } = require('../lib/guard.cjs');
+const { fillGuard, materialGuard, closeStalePages, toPlainContent } = require('../lib/guard.cjs');
 
 // 运行日志器（**旁路**：只多打印，不改变任何既有 console.log 的行为与时机）。
 // 放模块作用域是为了让末尾的 .catch() 也能收尾（异常路径要写 failed）。
@@ -222,9 +222,9 @@ function parseArgs(argv) {
   //         —— 宁可漏判（报错让人看）不可假成功。
   let gridOk = false;
   let gridState = null;
-  for (let i = 0; i < 20; i++) {
-    await sleep(3000);
-    const st = await p.evaluate(() => {
+  // 数九宫格（upload 与补图共用一份判据，别再抄第二份）
+  const countGrid = async () =>
+    p.evaluate(() => {
       const cands = [...document.querySelectorAll('img')].filter((x) => {
         const src = x.currentSrc || x.src || '';
         if (!src.includes('bmiddle')) return false;
@@ -240,14 +240,59 @@ function parseArgs(argv) {
         scope: form ? 'composer(.wbpro-form)' : '全页(找不到 composer 容器)',
       };
     }).catch(() => null);
+  for (let i = 0; i < 20; i++) {
+    await sleep(3000);
+    const st = await countGrid();
     if (!st) continue;
     gridState = st;
     console.log(`  t+${(i + 1) * 3}s 全页=${st.page} composer内=${st.scoped} 采用=${st.used}（范围=${st.scope}）`);
     if (st.used >= count) { gridOk = true; break; }
   }
   if (!gridOk) {
+    // ── 补图（生产库 2026-10-22 实测，坑位⑧⑨）────────────────────────
+    //   批量 filechooser 偶发只进去一部分。补图入口是**九宫格里的「+」空位**
+    //   （不是工具栏「图片」按钮 —— 那会新开一条微博）。每补一张必须看到计数
+    //   **真 +1**，不涨立即停手报错 ——「渲染张数 ≥ count」在 count 少算时是
+    //   假安全网，这里按声明 count 逐张补齐。
+    let have = gridState ? gridState.used : 0;
+    console.warn(`⚠ 九宫格只有 ${have}/${count} 张 → 逐张补图（入口=九宫格「+」空位）`);
+    for (let idx = have; idx < count; idx++) {
+      const f = imgs[idx];
+      if (!f || !fs.existsSync(f)) { console.warn(`✗ 补图缺文件：${f}`); break; }
+      const before = await countGrid();
+      const okAdd = await (async () => {
+        try {
+          const plus = await p.evaluate(() => {
+            const form = document.querySelector('.wbpro-form');
+            const scope = form || document;
+            const el = [...scope.querySelectorAll('div,span')].find((x) => (x.textContent || '').trim() === '+' && x.getBoundingClientRect().width > 30);
+            if (!el) return null;
+            const r = el.getBoundingClientRect();
+            return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+          });
+          const chooser2 = await pickFileWithRetry(p, async () => plus, { attempts: 3, timeout: 15000, step: 'weibo-topup' });
+          await chooser2.setFiles([f]);
+          return true;
+        } catch (e) {
+          console.warn(`第 ${idx + 1} 张补传失败：${e.message}`);
+          return false;
+        }
+      })();
+      await sleep(4000);
+      const after = await countGrid();
+      if (!okAdd || !after || after.used <= (before ? before.used : 0)) {
+        console.warn(`✗ 补第 ${idx + 1} 张计数没涨（${before ? before.used : 0}→${after ? after.used : 0}）→ 停手，请人工核对`);
+        break;
+      }
+      have = after.used;
+      gridState = after;
+      console.log(`已补 ${have}/${count} 张`);
+      if (have >= count) { gridOk = true; break; }
+    }
+  }
+  if (!gridOk) {
     throw new Error(
-      `九宫格没上全：只认出 ${gridState ? gridState.used : 0}/${count} 张` +
+      `九宫格没上全（含补图后）：只认出 ${gridState ? gridState.used : 0}/${count} 张` +
         `（判据=98×98 且 src 含 bmiddle，范围=${gridState ? gridState.scope : '?'}）。请人工核对页面。`
     );
   }
@@ -255,12 +300,20 @@ function parseArgs(argv) {
   log.step('九宫格渲染', `${gridState.used}/${count} 张（范围=${gridState.scope}）`);
 
   // 3) 填正文（微博无独立标题框，标题并入首行）
+  // ⚠️ 坑位⑩（生产库 2026-10-22）：上游稿件首行常是 markdown 标题（`# 站名：…`）——
+  //    直接进微博会露出字面井号 + 生成孤儿话题。toPlainContent 只去「井号+空白」
+  //    的标题标记，**不碰 #话题 / #话题# 标签行**（井号后没空格的才是标签）。
+  // ⚠️ 坑位⑬（生产库实测）：微博话题本体是 `#话题#`（两头井号）—— 单 `#` 服务端
+  //    不认、发出即死文本（此前几期单井号标签一个话题都没生成的根因）。上游微博稿
+  //    的标签行必须已是 #话题# 形态，本脚本**原样输入不做改写**；preflight 的
+  //    TAG_LINE_RE 两种形态都认（只认单井号会把微博标签行算进正文 → 字数口径偏大）。
+  const main = toPlainContent(text);
   const ta = await p.$('textarea[placeholder*="新鲜事"], textarea._input_1rz8r_8') || await p.$('textarea');
   if (!ta) throw new Error('未找到正文 textarea');
   await ta.click();
   await sleep(400);
   // 逐行输入触发联想（微博正文 #话题走联想），但先纯文本填入
-  await ta.fill(text);
+  await ta.fill(main);
   await sleep(1500);
   const filledLen = await ta.inputValue();
   console.log(`正文已填 ${filledLen.length} 字`);

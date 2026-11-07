@@ -88,6 +88,149 @@ let log = null;
 // 截图统一落 config.yaml 的 publish.screenshot_dir（不写死在脚本旁边）
 const shotPath = (name) => path.join(cfg.screenshotDir(), name);
 
+// ── 封面槽位共享读数（2026-10-22 生产库根因修复，移植）────────────────────
+// ⚠️ 关键认知：**「上传目标槽位」由右侧预览区的 tab（首页推荐/个人空间）决定，
+//    不是面板高亮** —— 点面板标题只改面板 active，预览 tab 不跟着变，文件仍投给
+//    tab 指向的槽 → 16:9 实际没改，两槽却都显示同一张图的裁切预览，光看 canvas
+//    齐备完全看不出投错。终验必须比对**画布像素**。
+
+/** 两槽面板（title + active + canvas 数） */
+function readCoverSlots(p) {
+  return p.evaluate(() => {
+    const vis = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    const dlg = [...document.querySelectorAll('.bcc-dialog')].find((x) => /封面制作/.test(x.textContent || '') && vis(x));
+    if (!dlg) return [];
+    return [...dlg.querySelectorAll('.cover-editor-panel-canvas > div')]
+      .filter((d) => vis(d) && d.querySelector('.cover-editor-panel-canvas-title'))
+      .map((d) => ({
+        title: (d.querySelector('.cover-editor-panel-canvas-title').textContent || '').trim().slice(0, 12),
+        active: /(^|\s)active(\s|$)/.test(d.className || ''),
+        hasCanvas: d.querySelectorAll('canvas').length > 0,
+      }));
+  }).catch(() => []);
+}
+
+/** 预览区两个 tab（首页推荐/个人空间）的选中态 */
+function readCoverTabs(p) {
+  return p.evaluate(() => {
+    const out = {};
+    for (const e of document.querySelectorAll('button, div, span')) {
+      if (e.children.length) continue;
+      const t = (e.textContent || '').trim();
+      if ((t === '首页推荐' || t === '个人空间') && e.getBoundingClientRect().width > 0) {
+        out[t] = /(^|\s)active(\s|$)/.test(e.className || '');
+      }
+    }
+    return out;
+  }).catch(() => ({}));
+}
+
+/** 两槽画布指纹（中心 + 四角像素）—— 判「文件到底投到了哪个槽」 */
+function readCoverFingerprints(p) {
+  return p.evaluate(() => {
+    const out = {};
+    for (const d of document.querySelectorAll('.cover-editor-panel-canvas > div')) {
+      const title = ((d.querySelector('.cover-editor-panel-canvas-title') || {}).textContent || '').trim().slice(0, 12);
+      const c = d.querySelector('canvas');
+      if (!c) { out[title] = 'no-canvas'; continue; }
+      let px = 'ERR';
+      try {
+        const ctx = c.getContext('2d');
+        px = [[4, 4], [c.width >> 1, c.height >> 1], [c.width - 5, c.height - 5], [4, c.height - 5], [c.width - 5, 4]]
+          .map(([x, y]) => { const d2 = ctx.getImageData(x, y, 1, 1).data; return `${d2[0]},${d2[1]},${d2[2]},${d2[3]}`; })
+          .join('|');
+      } catch (_) { /* tainted canvas 等 */ }
+      out[title] = px;
+    }
+    return out;
+  }).catch(() => ({}));
+}
+
+/** 两槽画布**中心像素**（重绘抗锯齿有 1~2 抖动，比对允许 ±16 色差） */
+function readCoverCenters(p) {
+  return p.evaluate(() => {
+    const out = {};
+    for (const d of document.querySelectorAll('.cover-editor-panel-canvas > div')) {
+      const title = ((d.querySelector('.cover-editor-panel-canvas-title') || {}).textContent || '').trim().slice(0, 12);
+      const c = d.querySelector('canvas');
+      if (!c) { out[title] = null; continue; }
+      try {
+        const px = c.getContext('2d').getImageData(c.width >> 1, c.height >> 1, 1, 1).data;
+        out[title] = [px[0], px[1], px[2]];
+      } catch (_) { out[title] = null; }
+    }
+    return out;
+  }).catch(() => ({}));
+}
+
+const nearSame = (a, b, tol = 16) =>
+  Array.isArray(a) && Array.isArray(b) && a.every((v, i) => Math.abs(v - b[i]) <= tol);
+
+/** 平台自己的标签计数：「还可以添加 N 个标签」→ N（权威口径，DOM 回读会少计） */
+function readTagQuota(p) {
+  return p.evaluate(() => {
+    const t = [...document.querySelectorAll('div,span')]
+      .map((x) => (x.textContent || '').trim())
+      .find((x) => x.length < 40 && /还可以添加\s*\d+\s*个标签/.test(x));
+    const m = t && t.match(/还可以添加\s*(\d+)\s*个标签/);
+    return m ? parseInt(m[1], 10) : null;
+  }).catch(() => null);
+}
+
+/**
+ * 切封面槽位（2026-10-22 根因修复版）：两条路都走（合成点预览 tab + 合成点目标
+ * 面板标题），**最终判据 = active 面板是不是目标槽**。只用合成点击（el.click()，
+ * 非可信事件 → 不可能拉起文件对话框抢占上传通道）。
+ */
+async function activateCoverSlot(p, slotTitleSrc, label) {
+  const tabText = slotTitleSrc.includes('首页') ? '首页推荐' : '个人空间';
+  const clickTab = () =>
+    p.evaluate((want) => {
+      const hit = [...document.querySelectorAll('button, div, span')].find((e) => {
+        if (e.children.length) return false;
+        if ((e.textContent || '').trim() !== want) return false;
+        const r = e.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && r.width < 160;
+      });
+      if (!hit) return false;
+      hit.click();
+      return true;
+    }, tabText);
+  const clickPanelTitle = () =>
+    p.evaluate((src) => {
+      const dlg = [...document.querySelectorAll('.bcc-dialog')].find((x) => /封面制作/.test(x.textContent || '') && x.getBoundingClientRect().width > 0);
+      if (!dlg) return false;
+      const d = [...dlg.querySelectorAll('.cover-editor-panel-canvas > div')].find((x) => {
+        const t = x.querySelector('.cover-editor-panel-canvas-title');
+        return t && (t.textContent || '').includes(src);
+      });
+      if (!d) return false;
+      const span = d.querySelector('.cover-editor-panel-canvas-title > span.text');
+      (span || d.querySelector('.cover-editor-panel-canvas-title') || d).click();
+      return true;
+    }, slotTitleSrc);
+
+  for (let i = 0; i < 3; i++) {
+    await clickTab();
+    await sleep(900);
+    let slots = await readCoverSlots(p);
+    let active = slots.find((s) => s.active);
+    if (!active || !active.title.includes(slotTitleSrc)) {
+      await clickPanelTitle();
+      await sleep(900);
+      slots = await readCoverSlots(p);
+      active = slots.find((s) => s.active);
+    }
+    if (active && active.title.includes(slotTitleSrc)) {
+      console.log(`槽位「${slotTitleSrc}」已就位（active 面板=${active.title}）✓`);
+      return true;
+    }
+    console.log(`切槽第 ${i + 1} 次没到位（active 面板=${active ? active.title : '无'}）→ 再试`);
+  }
+  console.warn(`⚠ 槽位「${slotTitleSrc}」切不过去（active 面板没切过去）—— 请人工在弹窗右侧切到对应比例后再上传`);
+  return false;
+}
+
 function parseArgs(argv) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -264,31 +407,60 @@ function parseArgs(argv) {
   // 5b) 逐词 type + Enter 创建，严格回读验证（失败重试一次）
   const tagInput = await p.$('input[placeholder*="标签"]');
   if (tagInput) {
+    // ⚠️ 2026-10-22 生产库加固（坑位⑬/㉤）：chip 变多后标签行会换行、输入框 y 下移 ——
+    //   复用一次性句柄从第 5 个词起会点空（「9 个只落 5 个」的真因，曾被错判为虚拟滚动）。
+    //   处置：每词**重新定位**输入框 + document.activeElement 确认拿到焦点 +
+    //   打字后 ≥2.2s / 回车后 ≥2.5s（平台异步建 tag，回车太密会被**静默吞掉**）+
+    //   收尾按 chip 列表补漏轮 + 终态用平台计数「还可以添加 N 个标签」（权威口径）。
+    const locateTagInput = async () =>
+      p.evaluate(() => {
+        const el = [...document.querySelectorAll('input')].find((x) => /标签/.test(x.placeholder || ''));
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : null;
+      });
+    const typeOneTag = async (t) => {
+      const pos = await locateTagInput();
+      if (!pos) { console.log('标签输入框漂移丢了（' + t + '）'); return false; }
+      await p.mouse.click(pos.x, pos.y);
+      await sleep(600);
+      const focused = await p.evaluate(() => {
+        const ae = document.activeElement;
+        return !!ae && ae.tagName === 'INPUT' && /标签/.test(ae.placeholder || '');
+      });
+      if (!focused) { console.log('标签输入框没拿到焦点（' + t + '）→ 重试'); return false; }
+      await p.keyboard.press('Control+A');
+      await p.keyboard.press('Delete');
+      await p.keyboard.type(t, { delay: 140 });
+      await sleep(2200); // 节流：联想面板稳定后再回车
+      const val = await p.evaluate(() => { const i2 = [...document.querySelectorAll('input')].find((x) => /标签/.test(x.placeholder || '')); return i2 ? i2.value : null; });
+      if (val !== t) { console.log('标签「' + t + '」输入值异常: ' + val); return false; }
+      await p.keyboard.press('Enter');
+      await sleep(2500); // 平台异步建 tag，回车太密会被吞
+      return (await readChips()).includes(t);
+    };
     const missing = [];
     for (const t of tags) {
-      let ok = false;
-      for (let i = 0; i < 2 && !ok; i++) {
-        if ((await readChips()).includes(t)) { ok = true; break; }
-        await tagInput.click();
-        await tagInput.fill('');
-        await tagInput.type(t, { delay: 120 });
-        await sleep(450);
-        const val = await p.evaluate(() => { const i2 = [...document.querySelectorAll('input')].find((x) => /标签/.test(x.placeholder || '')); return i2 ? i2.value : null; });
-        if (val !== t) { console.log('标签「' + t + '」输入值异常: ' + val); continue; }
-        await p.keyboard.press('Enter');
-        await sleep(750);
-        ok = (await readChips()).includes(t);
-      }
+      let ok = (await readChips()).includes(t);
+      for (let i = 0; i < 2 && !ok; i++) ok = await typeOneTag(t);
       console.log((ok ? '✓ ' : '✗ ') + t);
       if (!ok) missing.push(t);
     }
+    // 补漏轮：按 chip 列表再补一轮（首轮回车被吞是常态而非异常）
+    for (const t of [...missing]) {
+      if ((await readChips()).includes(t)) { missing.splice(missing.indexOf(t), 1); continue; }
+      console.log('补漏轮：' + t);
+      if (await typeOneTag(t)) missing.splice(missing.indexOf(t), 1);
+    }
     const selected = await readChips();
+    const quota = await readTagQuota(p);
     console.log('已选标签回读(' + selected.length + '):', selected.join(','));
+    if (quota != null) console.log('平台标签计数（权威口径）：还可以添加 ' + quota + ' 个标签');
     console.log(missing.length
       ? '警告：每日标签有词未落上: ' + missing.join(',') + ' —— 发布前请人工补'
       : (selected.length === tags.length ? '每日标签全部落上 ✓（' + selected.length + '/' + tags.length + '）' : '每日标签全部落上 ✓（含 ' + (selected.length - tags.length) + ' 个复用词）'));
     if (missing.length) log.warn('有 ' + missing.length + ' 个标签没落上: ' + missing.join(',') + ' —— 发布前请人工补');
-    else log.step('标签', selected.length + ' 个已落上');
+    else log.step('标签', selected.length + ' 个已落上' + (quota != null ? '（平台计数核验）' : ''));
   } else {
     console.log('警告：标签输入框未找到，本单无标签，发布前请人工补');
   }
@@ -445,22 +617,21 @@ function parseArgs(argv) {
       await p.mouse.click(area.x, area.y);
       await sleep(3000);
     };
-    // 单槽上传：切槽 → 确保「双比例同步改动」未勾 → 上传 → 兼容性裁剪「确定」（新版无此步）
+    // 单槽上传（2026-10-22 生产库根因修复版）：
+    //   切槽（预览 tab + 面板标题双路合成点击，判据=active 面板）→ 确保「双比例同步改动」
+    //   未勾 → 上传 → **画布指纹终验（目标槽必须真变）** → 兼容性裁剪「确定」（新版无此步）
+    //   ⚠️ 旧实现「点槽位画布区域切槽」已废弃 —— 槽位由预览 tab 决定，点画布/面板
+    //      都可能让文件投错槽（见 activateCoverSlot 头注释）。
     const setSlot = async (slotTitleSrc, file, label) => {
       await openDialog();
-      // 切槽必须点槽位 div 的画布区域（避开 title 行）——点 title 中心不触发切换，
-      // 会导致第二张图覆盖第一张的槽（2026-10-07 二次实测踩坑后修正）
-      const slot = await p.evaluate((src) => {
-        const re = new RegExp(src);
-        const vis = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-        const canvas = [...document.querySelectorAll('.cover-editor-panel-canvas > div')]
-          .find((d) => vis(d) && d.querySelector('.cover-editor-panel-canvas-title') && re.test((d.querySelector('.cover-editor-panel-canvas-title').textContent || '')));
-        if (!canvas) return null;
-        const r = canvas.getBoundingClientRect();
-        return { x: r.x + r.width / 2, y: r.y + Math.min(r.height * 0.6, 200), cls: canvas.className };
-      }, slotTitleSrc);
-      if (slot) { await p.mouse.click(slot.x, slot.y); await sleep(1500); }
-      else console.warn(label + '：未定位到槽位「' + slotTitleSrc + '」，按当前槽继续');
+      // 弹窗刚挂载时两个槽位可能还没渲染出来（面板要晚一拍才出现）
+      for (let i = 0; i < 15; i++) {
+        if ((await readCoverSlots(p)).length >= 2) break;
+        await sleep(1000);
+      }
+      await activateCoverSlot(p, slotTitleSrc, label);
+      // 指纹基线（上传**前**）：系统帧的画布指纹稳定，上传后目标槽指纹必须变
+      const fpBase = await readCoverFingerprints(p);
       const sync = await p.evaluate(() => {
         const lab = document.querySelector('label.sync-checkbox.bcc-checkbox') || document.querySelector('.sync-checkbox-wrapper');
         const inp = lab ? lab.querySelector('input[type=checkbox]') : null;
@@ -512,6 +683,27 @@ function parseArgs(argv) {
         console.log(label + ' 已提交:', path.basename(file));
       }
       await sleep(4000);
+      // ── 终验「文件投到哪个槽」（2026-10-22 生产库）：上传前 active 的面板就是
+      //   目标槽（预览 tab 决定的），它的画布指纹必须**变化**；没变 = 文件没落到
+      //   这个槽（切槽失败/平台没接住）。另一槽有时也跟着变 —— 平台会把 4:3 改动
+      //   镜像到 16:9 预览，属正常现象。
+      const activeTitle = await p.evaluate(() => {
+        const d = [...document.querySelectorAll('.cover-editor-panel-canvas > div')].find((x) => /(^|\s)active(\s|$)/.test(x.className || ''));
+        return d ? ((d.querySelector('.cover-editor-panel-canvas-title') || {}).textContent || '').trim().slice(0, 12) : null;
+      });
+      const fpAfter = await readCoverFingerprints(p);
+      const tKey =
+        activeTitle && fpAfter[activeTitle] !== undefined
+          ? activeTitle
+          : Object.keys(fpAfter).find((k) => slotTitleSrc.includes(k) || k.includes(slotTitleSrc.slice(0, 4)));
+      const targetChanged = tKey ? fpBase[tKey] !== fpAfter[tKey] : false;
+      console.log(
+        `${label} 槽位校验：目标槽「${tKey || '?'}」${targetChanged ? '已变 ✓' : '**没变** ✗'}` +
+          `（active=${activeTitle || '无'}）`
+      );
+      if (!targetChanged) {
+        throw new Error(`${label}：文件投进去后目标槽画布没变化 —— 可能预览 tab 没切过去，或平台没接住文件`);
+      }
       for (let i = 0; i < 3; i++) {
         const btn = await p.evaluate(() => {
           const el = [...document.querySelectorAll('button.bcc-button--primary')].find((x) => (x.textContent || '').trim() === '确定' && x.getBoundingClientRect().width > 0);
@@ -541,12 +733,33 @@ function parseArgs(argv) {
         if (fin) {
           await p.mouse.click(fin.x, fin.y);
           await sleep(2000);
+          // ⚠️ 二次确认框（2026-10-22 生产库，坑位⑫）：点「完成」后若 16:9 槽没拿到
+          //   图，平台弹「检测到个人空间封面（16:9）未修改，是否将 4:3 封面的改动同步
+          //   到 16:9？」（按钮：不同步，手动编辑 / 确认同步）。**出现 = 16:9 没拿到图**
+          //   → 选「不同步，手动编辑」保住 4:3 的成果 + 大声告警；且这个框会**伪装成
+          //   弹窗已关闭**（封面制作 dialog 检测不到），必须显式处理。
+          const confirmBox = await p.evaluate(() => {
+            const btn = [...document.querySelectorAll('button, div[role=button], span')]
+              .find((x) => (x.textContent || '').trim() === '不同步，手动编辑' && x.getBoundingClientRect().width > 0);
+            if (!btn) return null;
+            const r = btn.getBoundingClientRect();
+            return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+          });
+          if (confirmBox) {
+            await p.mouse.click(confirmBox.x, confirmBox.y);
+            console.warn('⚠ 平台提示「16:9 未修改」→ 已选【不同步，手动编辑】。16:9 封面没上传成功 —— 请人工补投或只发 4:3。');
+            if (log) log.warn('B站「16:9 未修改」确认框出现（16:9 槽没拿到图）—— 已选不同步，转人工');
+            await sleep(1500);
+            continue; // 回到循环继续找「完成」
+          }
           const still = await p.evaluate(() => !![...document.querySelectorAll('.bcc-dialog')].find((x) => /封面制作/.test(x.textContent || '') && x.getBoundingClientRect().width > 0));
           if (!still) { console.log('封面弹窗「完成」已点'); return true; }
         }
       }
       return false;
     };
+    // 点「完成」前取两槽画布**中心像素**基线（重开弹窗后比对 = 真图还在不在）
+    const fpDone = await readCoverCenters(p);
     await closeDialog();
     await sleep(2000);
     // 外层预览验证：封面设置区背景图出现（archive 域新图）——注意此检查有假阳性历史
@@ -557,19 +770,22 @@ function parseArgs(argv) {
       return [...zone.querySelectorAll('*')].some((d) => d.style && d.style.backgroundImage && d.style.backgroundImage !== 'none');
     });
     console.log(ok ? '封面外层预览已检出 ✓' : '警告：封面背景图未检出，请人工核对截图');
-    // 重开弹窗双槽终验：上传的图保存在各槽 canvas 里（img/背景图检测不可靠），
-    //     两槽 canvas 齐备 + 日志回显才算铁证；终验后幂等「完成」关闭弹窗
+    // 重开弹窗双槽终验（2026-10-22 生产库升级）：上传的图保存在各槽 canvas 里，
+    //     但「光看 canvas 齐备」看不出投错 —— 两槽会显示同一张图的裁切预览。
+    //     → 终验 = canvas 齐备 **且** 各槽画布中心像素与「完成」前一致（±16 色差
+    //       容忍重绘抖动）；终验后幂等「完成」关闭弹窗
     await openDialog();
-    const slots = await p.evaluate(() => {
-      const vis = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-      const dlg = [...document.querySelectorAll('.bcc-dialog')].find((x) => /封面制作/.test(x.textContent || '') && vis(x));
-      if (!dlg) return [];
-      return [...dlg.querySelectorAll('.cover-editor-panel-canvas > div')]
-        .filter((d) => vis(d) && d.querySelector('.cover-editor-panel-canvas-title'))
-        .map((d) => ({ title: (d.querySelector('.cover-editor-panel-canvas-title').textContent || '').trim().slice(0, 12), hasCanvas: d.querySelectorAll('canvas').length > 0 }));
-    });
+    const slots = await readCoverSlots(p);
+    const centersNow = await readCoverCenters(p);
     console.log('封面双槽终验:', JSON.stringify(slots));
-    const slotsOk = slots.length >= 2 && slots.every((s) => s.hasCanvas);
+    const centersOk = slots.length >= 2 && slots.every((s) => {
+      if (!s.hasCanvas) return false;
+      const a = fpDone[s.title];
+      const b = centersNow[s.title];
+      // 读不到像素（tainted canvas）不硬拦 —— 已有指纹终验兜底
+      return Array.isArray(a) && Array.isArray(b) ? nearSame(a, b) : true;
+    });
+    const slotsOk = centersOk;
     if (!slotsOk) console.warn('警告：双槽 canvas 不齐（期望 4:3+16:9 各一），请人工核对截图 ' + shotPath('bilibili.png'));
     await closeDialog();
     console.log(slotsOk && ok ? '封面已用自定义图落表单 ✓（' + (cover16File ? '4:3+16:9 双图分传' : '仅 4:3') + '）' : '警告：封面终验未全过，请人工核对截图');
@@ -604,7 +820,7 @@ function parseArgs(argv) {
   // 8) 截图，停「提交投稿」前
   await shot(p, SHOT);
   console.log('screenshot →', SHOT);
-  console.log('STATUS: 已停在「提交投稿」按钮前，等待用户点击提交');
+  console.log('STATUS: 已停在「立即投稿」按钮前（旧页叫「提交投稿」），等待用户点击提交');
   log.step('已停在「提交投稿」前', SHOT);
   log.finish('ok');
   process.exit(0);

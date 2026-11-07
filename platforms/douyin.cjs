@@ -58,7 +58,9 @@
 //   每步结尾截图并 process.exit(0)。
 //
 // ── 平台硬限制（这是平台规则，不是本工具的可调默认值）────────────────
-//   标题 10-30 字（20 最佳）；图片 1-12 张、3:4；图文正文 ≤2000 字；话题 1-5 个；封面默认首图。
+//   标题 10-30 字（20 最佳）；图片 1-35 张、3:4（⚠️ 上限是 35，不是早先记录的 12 ——
+//   生产库 2026-10-22 订正；jpg/jpeg/png/webp，不支持 gif，单张 ≤50MB）；
+//   图文正文 ≤2000 字；话题 1-5 个；封面默认首图。
 //   2026-10-06 简介降档：抖音简介（图文描述与视频简介同口径）上限由 1000 降为 900（视频简介实测
 //   1000 顶格截断），dy-body 一律按 ≤900 生成（上游生成侧有对应守卫），填单侧不再放行超限文本。
 //   标题 20 字符、正文 900 字这类数字来自平台侧限制，不是可以随手改的默认值——上游物料
@@ -101,6 +103,84 @@ function parseArgs(argv) {
 // 两处都没有 → 留空（跳过该字段 + 告警），绝不猜一个值填上去。
 function resolveAlbum(args) {
   return ('album' in args ? args.album : cfg.hint('douyin', 'album')) || '';
+}
+
+// ── 图集上传共享件（upload / collect 补图两处用，别再抄第二份）──────────
+
+/**
+ * 数**实际渲染**的图集缩略图。
+ * ⚠️ 「已添加 N 张图片」这个文字计数不可信（2026-10-22 生产库实测）——它统计的是
+ *    **上传队列**，会在缩略图还没渲染落位时就显示 N。判据必须数实际渲染的缩略图。
+ * 数法：从「继续添加」按钮往上找含图父容器，数其中 w>20 && h>20 的 <img>。
+ */
+function countRenderedThumbs(page) {
+  return page.evaluate(() => {
+    let anchor = null;
+    for (const el of document.querySelectorAll('button,div[role=button],a,span')) {
+      if ((el.textContent || '').trim() === '继续添加') { anchor = el; break; }
+    }
+    let scope = anchor;
+    for (let i = 0; i < 8 && scope; i++) {
+      const imgs = [...scope.querySelectorAll('img')].filter((im) => {
+        const r = im.getBoundingClientRect();
+        return r.width > 20 && r.height > 20;
+      });
+      if (imgs.length) return imgs.length;
+      scope = scope.parentElement;
+    }
+    // 退化：全页里数大尺寸图（抖音首页没有别的 98×98 干扰，比微博安全）
+    return [...document.querySelectorAll('img')].filter((im) => {
+      const r = im.getBoundingClientRect();
+      return r.width > 20 && r.height > 20;
+    }).length;
+  });
+}
+
+/**
+ * 传一张图：input 直塞 → 退化点「点击上传/继续添加」区走原生 filechooser。
+ * ⚠️ 入口偶发唤不起文件选择器（坐标与成功那轮完全一致）→ pickFileWithRetry
+ *    最多点 3 次，每次**重新取入口坐标**（页面重排后旧坐标会落空）。
+ * @returns {Promise<boolean>} 是否触发成功（落位要靠 countRenderedThumbs 复核）
+ */
+async function uploadOneImage(page, f) {
+  try {
+    const input = await page.waitForSelector('input[type=file][accept*="image"]', { timeout: 8000, state: 'attached' });
+    await input.setInputFiles([f]);
+    return true;
+  } catch (e) {
+    // input 没挂载 → 点「点击上传」区走原生 filechooser
+    // ⚠️ 2026-10-22 内化：入口偶发唤不起文件选择器 —— 微博/抖音图文/抖音视频都踩过。
+    // ⚠️ 2026-10-27 生产库实测补：第 1 张传完后上传区进入「继续添加」态，
+    //    原 file input 从 DOM 消失、入口文本也不再是「点击上传…图片」——
+    //    只认旧文案会让第 2 张起全部失败（实测 1/6 残缺图集）。
+    try {
+      const { pickFileWithRetry } = require('../lib/wait.cjs');
+      const chooser = await pickFileWithRetry(
+        page,
+        async () => {
+          const pos = await page.evaluate(() => {
+            const el = [...document.querySelectorAll('div,span,label')].find((x) => {
+              const t = (x.textContent || '').trim();
+              if (/点击上传/.test(t) && /图片/.test(t) && x.children.length === 0) return true;
+              if (/^继续添加$/.test(t) && x.children.length === 0) return true;
+              return false;
+            });
+            if (!el) return null;
+            const r = el.getBoundingClientRect();
+            if (r.width < 5) return null;
+            return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+          });
+          return pos;
+        },
+        { attempts: 3, timeout: 15000, step: 'douyin' }
+      );
+      await chooser.setFiles([f]);
+      return true;
+    } catch (e2) {
+      console.warn('「' + path.basename(f) + '」没传上：' + e2.message);
+      return false;
+    }
+  }
 }
 
 // ── 抖音图文「配乐」选择（2026-10-22）────────────────────────────────────
@@ -452,74 +532,12 @@ async function kindOf(page) {
       //      会在缩略图还没渲染落位时就显示 N。实测：文字说 6、截图只有 1 张、
       //      几秒后 DOM 里 6 张都在。判据必须**数实际渲染出来的缩略图**。
       //   ③ 缩略图是**延迟渲染**的 → 收尾要等实际缩略图数 == count 再截图。
-      //      数法：从「继续添加」按钮往上找含图的父容器，数其中 w>20 && h>20 的 <img>。
-      const countRendered = () =>
-        page.evaluate(() => {
-          // 定位「继续添加」按钮，它所在的含图容器就是图集区
-          let anchor = null;
-          for (const el of document.querySelectorAll('button,div[role=button],a,span')) {
-            if ((el.textContent || '').trim() === '继续添加') { anchor = el; break; }
-          }
-          let scope = anchor;
-          for (let i = 0; i < 8 && scope; i++) {
-            const imgs = [...scope.querySelectorAll('img')].filter((im) => {
-              const r = im.getBoundingClientRect();
-              return r.width > 20 && r.height > 20;
-            });
-            if (imgs.length) return imgs.length;
-            scope = scope.parentElement;
-          }
-          // 退化：全页里数大尺寸图（抖音首页没有别的 98×98 干扰，比微博安全）
-          return [...document.querySelectorAll('img')].filter((im) => {
-            const r = im.getBoundingClientRect();
-            return r.width > 20 && r.height > 20;
-          }).length;
-        });
+      //      数法见模块级 countRenderedThumbs()（upload / collect 补图共用一份）。
+      const countRendered = () => countRenderedThumbs(page);
       // 逐张传（单张是稳定的）
       let uploaded = 0;
       for (const f of imgs) {
-        const ok = await (async () => {
-          try {
-            const input = await page.waitForSelector('input[type=file][accept*="image"]', { timeout: 8000, state: 'attached' });
-            await input.setInputFiles([f]);
-            return true;
-          } catch (e) {
-            // input 没挂载 → 点「点击上传」区走原生 filechooser
-            // ⚠️ 2026-10-22 内化：**入口偶发唤不起文件选择器**（坐标与成功那轮完全一致，
-            //   但 filechooser 就是不弹）—— 微博 / 抖音图文 / 抖音视频三个平台都踩过。
-            //   → pickFileWithRetry：最多点 3 次，每次**重新取入口坐标**（页面重排后旧坐标会落空）。
-            try {
-              const { pickFileWithRetry } = require('../lib/wait.cjs');
-              const chooser = await pickFileWithRetry(
-                page,
-                async () => {
-                  const pos = await page.evaluate(() => {
-                    const el = [...document.querySelectorAll('div,span,label')].find((x) => {
-                      const t = (x.textContent || '').trim();
-                      // ⚠️ 2026-10-27 ego 实测补：第 1 张传完后上传区进入「继续添加」态，
-                      //    原 file input 从 DOM 消失、入口文本也不再是「点击上传…图片」——
-                      //    只认旧文案会让第 2 张起全部失败（实测 1/6 残缺图集）。
-                      if (/点击上传/.test(t) && /图片/.test(t) && x.children.length === 0) return true;
-                      if (/^继续添加$/.test(t) && x.children.length === 0) return true;
-                      return false;
-                    });
-                    if (!el) return null;
-                    const r = el.getBoundingClientRect();
-                    if (r.width < 5) return null;
-                    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-                  });
-                  return pos;
-                },
-                { attempts: 3, timeout: 15000, step: 'douyin' }
-              );
-              await chooser.setFiles([f]);
-              return true;
-            } catch (e2) {
-              console.warn('第 ' + (uploaded + 1) + ' 张没传上：' + e2.message);
-              return false;
-            }
-          }
-        })();
+        const ok = await uploadOneImage(page, f);
         if (ok) uploaded++;
         // 等这一张落位（缩略图延迟渲染）
         await sleep(1500);
@@ -701,7 +719,8 @@ async function kindOf(page) {
     const baseLen = topicState.len;
     const baseChips = topicState.chips;
     let linked = 0;
-    const skippedTags = [];   // 抖音话题库里确实没有这个词
+    const skippedTags = [];   // 抖音话题库里确实没有这个词（内容侧要换词）
+    const notLandedTags = []; // 库里有候选、也点了，但没落成 chip（发布侧 UI 问题，重试可见）
     const overLimitTags = []; // 填满上限才没轮到（与上面是两回事，日志要分开报）
     let topicGarbled = false;
 
@@ -756,7 +775,9 @@ async function kindOf(page) {
           topicState = fixed;
           break;
         }
-        skippedTags.push(kw);
+        // ⚠️ 三分类（对齐生产库 2026-11-02）：「库里有候选但没落 chip」≠「库里没有」
+        //    —— 前者是发布侧 UI 问题（重跑可能就好），后者是内容侧要换词。分开报。
+        notLandedTags.push(kw);
         topicState = fixed;
         continue;
       }
@@ -778,7 +799,10 @@ async function kindOf(page) {
       topicGarbled = true;
     }
     if (skippedTags.length) {
-      console.log('话题跳过 ' + skippedTags.length + ' 个（抖音话题库无此话题）: ' + skippedTags.join('/'));
+      console.log('话题跳过 ' + skippedTags.length + ' 个（抖音话题库无此话题，内容侧换词）: ' + skippedTags.join('/'));
+    }
+    if (notLandedTags.length) {
+      console.log('话题有 ' + notLandedTags.length + ' 个点了候选但没落 chip（发布侧 UI 问题，重跑可能恢复）: ' + notLandedTags.join('/'));
     }
     if (overLimitTags.length) {
       console.log('话题另有 ' + overLimitTags.length + ' 个未填（已达抖音上限 ' + TOPIC_MAX + ' 个，非「话题库没有」）: ' + overLimitTags.join('/'));
@@ -833,38 +857,115 @@ async function kindOf(page) {
     // 由用户在点发布前手选。显式传空 --album 可用于本次跳过。
     const album = resolveAlbum(args);
     if (!album) cfg.warnSkipped('douyin', 'album', '抖音合集');
+
+    // 0) 收尾补图（生产库 2026-10-27 实测，坑位⑨）：图集会在填标题/描述/话题/关
+    //    声明弹窗的某一步被平台**重置回 1 张**（重置点未定位）→ collect 开头复核，
+    //    不足就逐张补（幂等：每张独立判「渲染数真 +1」，不涨立即停手转人工）。
+    //    （--media/--count 由清单的 collect 命令携带；旧调用不带这两个参数 → 跳过）
+    if (kind === 'image' && args.media && args.count) {
+      const want = parseInt(args.count, 10);
+      let have = await countRenderedThumbs(page);
+      if (have < want) {
+        console.warn(`⚠ 图集只剩 ${have}/${want} 张（疑似被平台重置）→ collect 开头逐张补图`);
+        const mediaDir = path.resolve(args.media);
+        for (let i = have; i < want; i++) {
+          const f = path.join(mediaDir, `img-${String(i + 1).padStart(2, '0')}.png`);
+          if (!fs.existsSync(f)) { console.warn(`✗ 补图缺文件：${f}`); break; }
+          const before = await countRenderedThumbs(page);
+          await uploadOneImage(page, f);
+          await sleep(1500);
+          const after = await countRenderedThumbs(page);
+          if (after <= before) { console.warn(`✗ 补第 ${i + 1} 张渲染数没涨（${before}→${after}）→ 停手，请人工核对`); break; }
+          have = after;
+          console.log(`已补 ${have}/${want} 张`);
+        }
+        const dl = Date.now() + 20000;
+        while (have < want && Date.now() < dl) { await sleep(1000); have = await countRenderedThumbs(page); }
+        console.log(have >= want ? `补图复核：${have}/${want} ✓` : `⚠ 补图后仍 ${have}/${want} —— 请人工核对`);
+        log.step('补图', `${have}/${want}`);
+      }
+    }
+
     // 1) 合集：点「请选择合集」（视频页）/「不选择合集」（图文页）→ 下拉点选目标合集
     // 2026-09-30 修：图文页比视频页长（多封面/图片编辑区），合集区常在视口外
     // （实测 y=1002 vs 视口 907），坐标 mouse.click 落空 → 下拉未开 → 「选项未找到」
     // FATAL（三期三败，仅图文复现）。点击前 scrollIntoView 拉回视口。
-    const csel = album ? await page.evaluate(() => {
-      const el = [...document.querySelectorAll('.semi-select-selection-text')].find((x) => ['请选择合集', '不选择合集'].includes((x.textContent || '').trim()));
-      if (!el) return null;
-      el.scrollIntoView({ block: 'center' });
-      const r = el.getBoundingClientRect();
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-    }) : null;
-    if (csel) {
-      await page.mouse.click(csel.x, csel.y);
-      await page.waitForTimeout(2500);
-      const opt = await page.evaluate((name) => {
-        for (const el of document.querySelectorAll('*')) {
-          const t = (el.textContent || '').trim();
-          if (t === name && el.children.length === 0) {
-            const r = el.getBoundingClientRect();
-            if (r.width > 10) return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    //
+    // ⚠️ 2026-10-27 生产库实测升级（串栏目事故）——收尾校验**不能用全页文本 includes**：
+    //    合集下拉开着时，选项列表里就有合集名 → 全页 includes 把「没点上」判成「已选上」；
+    //    更糟的是点选项落点偏移会选到同账号**别的栏目**（实测表单落了另一条线的合集）。
+    //    → 判据改为：控件真值 + 点击命中断言（elementFromPoint）+ 失败重开重试 +
+    //      读到别的合集 = 硬失败（对齐生产库 douyin-album 模块）。
+    if (album) {
+      const openDropdown = async () => {
+        const csel = await page.evaluate(() => {
+          const el = [...document.querySelectorAll('.semi-select-selection-text')].find((x) => ['请选择合集', '不选择合集'].includes((x.textContent || '').trim()));
+          if (!el) return null;
+          el.scrollIntoView({ block: 'center' });
+          const r = el.getBoundingClientRect();
+          return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+        });
+        if (!csel) return 'no-entry';
+        await page.mouse.click(csel.x, csel.y);
+        await page.waitForTimeout(2500);
+        return 'opened';
+      };
+      const pickOption = () =>
+        page.evaluate((name) => {
+          for (const el of document.querySelectorAll('*')) {
+            const t = (el.textContent || '').trim();
+            if (t === name && el.children.length === 0) {
+              const r = el.getBoundingClientRect();
+              if (r.width <= 10) continue;
+              const x = r.x + r.width / 2, y = r.y + r.height / 2;
+              // ⚠️ 点击命中断言：坐标中心必须真落在这个元素（或其子元素）上
+              const hit = document.elementFromPoint(x, y);
+              if (!hit || !(el === hit || el.contains(hit) || (hit.textContent || '').trim() === name)) continue;
+              return { x, y };
+            }
           }
-        }
-        return null;
-      }, album);
-      if (!opt) throw new Error('合集「' + album + '」选项未找到（平台未推荐该合集？）');
-      await page.mouse.click(opt.x, opt.y);
-      await page.waitForTimeout(2000);
-      // 校验改全页文本（2026-09-30）：图文页合集选中后显示在输入框形态，不在
-      // .semi-select-selection-text 里，旧校验假阴性报「状态异常」（实际已选上）
-      const ok = await page.evaluate((name) => document.body.innerText.includes(name), album);
-      console.log(ok ? '合集已选: ' + album + ' ✓' : '警告：合集状态异常，请人工核对');
-    } else console.log(album ? '合集已设置过（未找到空下拉），跳过' : '合集：未配置，本次不选择');
+          return null;
+        }, album);
+      // 读控件**真值**：剥「共N个内容」尾缀；排除「合集」半选标签与「不选择合集」占位。
+      // 图文页选中后显示在输入框形态（2026-09-30 实测）→ 两类控件都扫。
+      const readValue = () =>
+        page.evaluate((name) => {
+          const norm = (s) => String(s || '').trim().replace(/共\d+个内容.*$/, '').trim();
+          for (const t of [...document.querySelectorAll('.semi-select-selection-text')].map((x) => (x.textContent || '').trim())) {
+            if (!t || t === '请选择合集' || t === '不选择合集' || t === '合集') continue;
+            if (norm(t) === name) return t;
+          }
+          for (const t of [...document.querySelectorAll('input')].map((x) => (x.value || '').trim())) {
+            if (t && norm(t) === name) return t;
+          }
+          return '';
+        }, album);
+
+      let foundOption = false;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        const opened = await openDropdown();
+        if (opened === 'no-entry') break; // 没有空下拉 → 可能已设置过，交给真值判定
+        const opt = await pickOption();
+        if (!opt) { console.log(`合集「${album}」下拉里没有该选项（第 ${attempt} 次）—— 平台未推荐该合集？`); continue; }
+        foundOption = true;
+        await page.mouse.click(opt.x, opt.y);
+        await page.waitForTimeout(2000);
+        if (await readValue()) break;
+      }
+      const final = await readValue();
+      if (final && final.replace(/共\d+个内容.*$/, '').trim() !== album) {
+        throw new Error(
+          `[串栏目] 合集控件实际值是「${final}」，不是本线目标「${album}」—— ` +
+            '点选落到了别的栏目。必须人工改回后再发（别让两条线的内容混进同一栏目）。'
+        );
+      }
+      if (!final) {
+        if (!foundOption) throw new Error('合集「' + album + '」选项未找到（平台未推荐该合集？）');
+        console.warn(`⚠ 合集状态未确认（控件里没读到「${album}」）—— 请人工核对后再发布`);
+      } else {
+        console.log(`合集已选: ${album} ✓（按控件真值）`);
+      }
+    } else console.log('合集：未配置，本次不选择');
     // 2) 自主声明：是否代填「内容由AI生成」由 config.yaml 的 platforms.douyin.self_declare 决定。
     //    未配置或为 false → 不代填（合规标注仍需用户自己在发布页选），统一告警一次。
     const selfDeclare = cfg.bool('douyin', 'self_declare');
