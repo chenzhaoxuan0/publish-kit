@@ -19,7 +19,7 @@
 //   node platforms/douyin.cjs collect [--kind image|video] [--album "<合集名>"]
 //       选合集 + 自主声明「内容由AI生成」（2026-09-23 起经实测确定图文与视频都填）。
 //   node platforms/douyin.cjs music [--kind image] [--music "<曲名>"]
-//       选配乐（2026-10-22 起自动化，之前一直是人工选「收藏配乐 Opus 37」）。
+//       选配乐（2026-10-22 起自动化，之前一直是人工选「收藏配乐（某首曲名）」）。
 //       走「收藏」tab → 按曲名精确匹配 → 点卡片上的「使用」。**仅图文线有配乐入口**。
 //   node platforms/douyin.cjs shot [--kind image|video]
 //       截图存档（publish.screenshot_dir 下 douyin-image.png / douyin-video.png）。
@@ -30,7 +30,7 @@
 //        地址取 config.yaml 的 runtime.cdp_url（也可用环境变量 CDP_URL 临时覆盖）。
 //        patchright **惰性加载**（ego 通道绝不 import 它）。
 //      · ego：本脚本被 bin/ego-run.ps1 动态 import 进 ego-browser 运行时
-//        （globalThis.__OP_ARGS__ 注入参数），页面操作走 lib/drivers/ego.cjs 的
+//        （globalThis.__KIT_ARGS__ 注入参数），页面操作走 lib/drivers/ego.cjs 的
 //        Playwright 形状门面。登录态在 ego lite 自己的 profile 里。
 //      两条通道共用下面全部平台知识；通道差异只许出现在 lib/driver 层。
 //   2) 登录态由浏览器 profile 负责，本脚本不碰、不创建、不迁移任何浏览器 profile。
@@ -333,8 +333,8 @@ async function kindOf(page) {
 }
 
 (async () => {
-  // 参数来源双通道：ego 运行时（ego-run.ps1 wrapper 注入 __OP_ARGS__）| 普通 node（CLI argv）
-  const args = globalThis.__OP_ARGS__ || parseArgs(process.argv.slice(2));
+  // 参数来源双通道：ego 运行时（ego-run.ps1 wrapper 注入 __KIT_ARGS__）| 普通 node（CLI argv）
+  const args = globalThis.__KIT_ARGS__ || parseArgs(process.argv.slice(2));
   // --force 的三种到达形态：CLI 裸开关 / argv 里的字符串 / ScriptArgs 布尔
   const FORCE =
     process.argv.includes('--force') ||
@@ -349,7 +349,7 @@ async function kindOf(page) {
   // 截图统一落 config.yaml 的 publish.screenshot_dir（默认 ./screenshots），目录不存在即建
   const SHOT = path.join(cfg.screenshotDir(), kind === 'video' ? 'douyin-video.png' : 'douyin-image.png');
   fs.mkdirSync(path.dirname(SHOT), { recursive: true });
-  // ⚠️ 2026-10-22 内化（content 工作区 ego 通道实测）：**体检必须在起浏览器之前**。
+  // ⚠️ 2026-10-22 内化（生产库 ego 通道实测）：**体检必须在起浏览器之前**。
   //   「上传后确认成功」的判据只能证明**页面上的东西**，证明不了**喂进去的东西**。
   //   真实事故：某平台的 images 只列了 1 张 → count=1 → 各平台只传了 1 张图，
   //   而每个平台的判据都「通过」了（1 ≥ 1 恒成立）→ 脚本报成功，结果全是残缺图集。
@@ -442,7 +442,7 @@ async function kindOf(page) {
       const count = parseInt(args.count || '7', 10);
       const imgs = Array.from({ length: count }, (_, i) => path.join(media, `img-${String(i + 1).padStart(2, '0')}.png`));
       imgs.forEach((f) => { if (!fs.existsSync(f)) throw new Error(`图片缺失: ${f}`); });
-      // ⚠️ 2026-10-22 实测修正（content 工作区 ego 通道实测，本轮内化）：
+      // ⚠️ 2026-10-22 实测修正（生产库 ego 通道实测，本轮内化）：
       //   ① **批量多选不可靠** —— 同一份代码同一个环境，给 6 张的结果在
       //      6/6、1/6、0/6 之间跳（连测 8 次）。**单张上传是稳定的** → 改成逐张传，
       //      每张传完等这一张的缩略图真的落位再传下一张。慢几秒，换确定性。
@@ -580,7 +580,7 @@ async function kindOf(page) {
     const topicTags = (bodyNorm.match(/#[^\s#]+/g) || []).map((x) => x.slice(1));
     await editor.click();
     await page.waitForTimeout(500);
-    // ⚠️ 2026-10-22 内化提速（content 工作区 ego 通道实测）：
+    // ⚠️ 2026-10-22 内化提速（生产库 ego 通道实测）：
     //   逐字 keyboard.type 每敲一个字符都是一次 CDP 往返，N 个字符 = N 次往返。
     //   实测 958 字：逐块 type 要 12s，insertText 约 0.6s，**省约 11s**。
     //   ⚠️ insertText 不保证触发编辑器的 input 事件 → **必须回读校验**，
@@ -790,7 +790,7 @@ async function kindOf(page) {
 
   if (cmd === 'music') {
     // 抖音图文「配乐」：收藏 → 指定曲目 → 点「使用」
-    // 2026-10-22 起自动化（之前一直是人工选「收藏配乐 Opus 37」）。
+    // 2026-10-22 起自动化（之前一直是人工选「收藏配乐（某首曲名）」）。
     //
     // ⚠️ **只有图文线有配乐入口**（视频线是视频自带音轨，没有这一步）。
     //    视频线误用要**立刻报错**，不能静默失败让人以为配上了。
@@ -798,7 +798,7 @@ async function kindOf(page) {
       throw new Error('music 子命令仅支持 --kind image（视频线是视频自带音轨，没有配乐入口）');
     }
     //
-    // ── 地面真相（ego lite 真机探针实测，与 content 工作区 ego 通道同源）──
+    // ── 地面真相（ego lite 真机探针实测，与 生产库 ego 通道同源）──
     //   ① 入口 = 扩展信息区「选择音乐」。⚠️ 页面上这文案出现**两次**：
     //      行标题（span.title-content-*）与右侧**动作按钮**（span.action-*）——
     //      点标题不生效，必须点 action 那个。
@@ -948,7 +948,7 @@ async function kindOf(page) {
       await page.mouse.click(slotBox.x, slotBox.y);
       await page.waitForTimeout(3000);
       // 2) 校验/切换编辑器模式（防把横图传进竖编辑器）
-      //    ⚠️ 2026-10-22 修正（content 工作区 ego 通道实测）：
+      //    ⚠️ 2026-10-22 修正（生产库 ego 通道实测）：
       //    原来判据是「`.dy-creator-content-modal` 里有没有标题文本恰为『设置竖封面』」。
       //    两个问题：
     //      a) **没步骤条 ≠ 错**。抖音在「某个封面已经设过」之后，再开另一个封面的
@@ -1116,9 +1116,9 @@ async function kindOf(page) {
   // 异常路径也要把日志收尾（耗时表 + 告警汇总），否则失败时反而没有留痕
   try {
     require('../lib/log.cjs')
-      .create({ platform: 'douyin', kind: (() => { try { return (globalThis.__OP_ARGS__ || parseArgs(process.argv.slice(2))).kind || 'image'; } catch (_) { return 'image'; } })() })
+      .create({ platform: 'douyin', kind: (() => { try { return (globalThis.__KIT_ARGS__ || parseArgs(process.argv.slice(2))).kind || 'image'; } catch (_) { return 'image'; } })() })
       .finish('failed');
   } catch (_) { /* 日志收尾失败不影响主流程 */ }
-  if (globalThis.__OP_ARGS__) process.exitCode = 1; // ego 运行时：自然结束
+  if (globalThis.__KIT_ARGS__) process.exitCode = 1; // ego 运行时：自然结束
   else process.exit(1);
 });

@@ -17,12 +17,12 @@
     a) ego-browser 可能不在当前终端的 PATH 里（PATH 注册在 User 级、当前进程早于注册）。
        本脚本依次尝试：PATH → User PATH 里的 junction → 已知安装目录。
     b) ego 运行时不继承环境变量，也不透传 argv（实测 process.env / process.argv 均拿不到调用方参数）。
-       所以参数通过「生成一个 wrapper .mjs」注入：wrapper 里先把 globalThis.__OP_ARGS__
+       所以参数通过「生成一个 wrapper .mjs」注入：wrapper 里先把 globalThis.__KIT_ARGS__
        设好，再 import 真正的脚本。脚本用 `readArgs()` 取。
     c) 运行时的 cwd 是 ego lite 的安装目录，不是本工作区。脚本内一切路径都必须是绝对路径。
 
 .EXAMPLE
-  pwsh -File bin/ego-run.ps1 -Script 04_skills/ego-publish/platforms/weibo.mjs `
+  pwsh -File bin/ego-run.ps1 -Script platforms/weibo.cjs `
         -ScriptArgs @{ media = 'C:/x/img'; bodyFile = 'C:/x/body.md'; count = 6 }
 #>
 [CmdletBinding()]
@@ -76,12 +76,11 @@ function Resolve-EgoBrowser {
   if ($cmd) { return $cmd.Source }
 
   # 2c. User 级 PATH 里注册的 junction（路径可能用 / 或 \ 混写）
-  #     ⚠️ 这个 junction 可能**落后于已安装的最新版本**（ego lite 每天自动升级，
-  #       实测 2026-10-24 06:51 0.6.0.20 → 0.6.0.22，而 junction 还指着 0.6.0.20）。
-  #       **但顺序不能改**：实测 0.6.0.22 的 CLI 在 agent 沙箱里
+  #     ⚠️ 这个 junction 可能**落后于已安装的最新版本**（ego lite 会自动升级，
+  #       实测 2026-10-24：当天升级到新版，junction 仍指旧版）。
+  #       **但顺序不能改**：实测新版 CLI 在 agent 沙箱里
   #       「Failed to connect to ego_cli bootstrap」（exit 5），根本跑不起来；
-  #       而 0.6.0.20 的 CLI 与 0.6.0.22 的 GUI 混用**填单完全正常**
-  #       （2026-10-24 12:13 之后微博/抖音/知乎都跑通了）。
+  #       而旧版 CLI 与新版 GUI 混用**填单完全正常**（2026-10-24 当天微博/抖音/知乎都跑通了）。
   #       → 所以：**junction 优先，最新安装版本只作兜底**。
   #       → 真要升 ego lite，得在沙箱外（或 Full Access）跑 `ego-browser upgrade`。
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -176,7 +175,7 @@ if (-not $argsJson) { $argsJson = '{}' }
 
 $wrapper = @"
 // 由 ego-run.ps1 自动生成的参数注入 wrapper —— 不要手改，每次运行都会重建。
-globalThis.__OP_ARGS__ = $argsJson;
+globalThis.__KIT_ARGS__ = $argsJson;
 await import('$(ConvertTo-FileUrl $scriptPath)');
 "@
 [IO.File]::WriteAllText($wrapperPath, $wrapper, (New-Object System.Text.UTF8Encoding($false)))

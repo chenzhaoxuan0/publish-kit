@@ -569,7 +569,7 @@ function locateUploadTrigger(p, inputSel, hintRe, acceptRe) {
         await sleep(2200);
         const opt = await p.evaluate((name) => {
           let f = null;
-          // 2026-10-15 修：平台给合集选项文本追加了内容计数（如「每日新闻共28个内容」），
+          // 2026-10-15 修：平台给合集选项文本追加了内容计数（如「<合集名>共28个内容」），
           // 旧的 `=== name` 精确相等永远匹配不上 → 每期都走到「选项未出现」转人工。
           // 改为 startsWith；option-item 类被 位置/活动 下拉共用，但那些文本不会以合集名开头。
           const walk = (root) => { for (const el of root.querySelectorAll('*')) { if (f) return; if (el.shadowRoot) walk(el.shadowRoot); if (((el.className || '') + '').includes('option-item') && (el.textContent || '').trim().startsWith(name)) { const r = el.getBoundingClientRect(); if (r.width > 10 && r.height < 60) f = { x: r.x + r.width / 2, y: r.y + r.height / 2 }; } } };

@@ -14,7 +14,7 @@
 //   --platforms    逗号分隔的平台 key（默认 = config.yaml 里所有 enabled 的）
 //   --kind         image | video（默认 image）
 //   --concurrency  并发上限（默认 5 —— 见下方「为什么是 5」）
-//   --content-key  内容标识（如 "2026-10-21_AI热点速递卡片#video"）。
+//   --content-key  内容标识（如 "2026-10-21_示例专题#video"）。
 //                  配了 publish.ledger 时用于**防重复发布闸门**（同一条内容只发一次）
 //   --allow-repeat 显式允许重复（绕过台账闸门）
 //   --video/--media/--count/--title/--body-file/--cover/--tags

@@ -157,7 +157,7 @@ async function main() {
       problems.push('ego-browser');
     }
     const prefix = driver.spacePrefix();
-    console.log(ok(`TaskSpace 空间前缀 ${C.dim}${prefix}${C.reset}（与 operation 的 op 前缀隔离）`));
+    console.log(ok(`TaskSpace 空间前缀 ${C.dim}${prefix}${C.reset}（多项目并行时以不同前缀隔离）`));
     console.log(`\n${C.dim}ego 通道的登录态在 ego lite 自己的 profile 里 —— 在 ego lite 窗口里登录即可，`);
     console.log(`本命令不做逐平台登录态检查。干跑运行器：pwsh -NoProfile -File bin/ego-run.ps1 -WhatIfOnly ...${C.reset}`);
     console.log('\n' + '─'.repeat(60));

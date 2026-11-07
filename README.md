@@ -160,7 +160,7 @@ node bin/publish-manifest.cjs publish.yaml --variants image --only douyin,zhihu
 ```yaml
 version: 1
 content:
-  key: "2026-10-26_AI热点速递卡片"   # 防重复闸门的内容标识
+  key: "2026-10-26_示例专题"          # 防重复闸门的内容标识
 variants:                            # 分发变体：同一份内容的不同形态
   image:
     slots:
@@ -170,7 +170,7 @@ variants:                            # 分发变体：同一份内容的不同�
         bodyFile: "manuscript/douyin.txt"
         media: "upload-kit/media"
         count: 8
-        options: { album: "每日新闻", music: "Opus 37" }
+        options: { album: "示例合集", music: "示例音乐" }
       - platform: xiaohongshu
         via: manual                        # 零自动化，只备料
         note: "零自动化，仅备料"
@@ -256,8 +256,8 @@ node bin/publish-all.cjs --platforms douyin,weibo,zhihu --kind image \
 ego 通道的三条专有约定：
 
 1. **TaskSpace 空间名 = `<前缀>-<平台>-<线>-<内容key>`**，前缀默认 `pk`（`runtime.space_prefix`）。
-   空间名在 ego 应用里**全局唯一** —— publish-kit 用 `pk` 与 operation 工作区的 `op` 隔离，
-   两边才能同时并行发布。一期一个空间：填完 `handOff()` 交还用户后，agent 接管不了旧空间。
+   空间名在 ego 应用里**全局唯一** —— 多个项目共用一个 ego lite 时，各自用不同前缀
+   （本仓库默认 `pk`）隔离，才不会互相接管对方的表单页。一期一个空间：填完 `handOff()` 交还用户后，agent 接管不了旧空间。
 2. **只有序列最后一条命令交还用户**。编排器会自动给最后一条命令注入 `--handoff 1`；
    中间命令交还 = 后续命令撞墙（handOff 之后 agent 不能自行接管，这是 ego 的 hard stop）。
 3. **>48MB 大文件不走 ego**：ego 的 filechooser 大文件路径未实测，脚本会明确报错转人工
@@ -450,7 +450,7 @@ npx publish-kit platforms   # 列出所有脚本与用法
 ### 已有的另一条通道（参考实现）
 
 「把整套填单流程搬到另一条受控浏览器上跑」这个需求，已经有人做出来了 ——
-在 content 工作区里以 `04_skills/ego-publish/` 的形式存在（独立于本仓库，
+在另一个生产工作区里以独立 skill 的形式存在（不在此仓库，
 因为它还带了内容生产线的编排层）。
 
 它带来的**最大收获不是「多一条通道」，而是把凭手感的地方全变成了可判定的判据**：

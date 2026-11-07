@@ -26,8 +26,8 @@ runtime:
   driver: "playwright"
 
   # TaskSpace 空间名前缀（**只对 ego 通道生效**）。
-  # ⚠️ TaskSpace 空间名在 ego 应用里**全局唯一**——本仓库用 pk，
-  #    与 operation 工作区的 op 前缀隔离，两边才能同时并行发布。
+  # ⚠️ TaskSpace 空间名在 ego 应用里**全局唯一**——本仓库默认用 pk；
+  #    多个项目并行使用同一个 ego lite 时，各用不同前缀隔离，才不会互相接管对方的表单页。
   space_prefix: "pk"
 
   # CDP 调试端口（playwright 通道）。
@@ -89,11 +89,11 @@ platforms:
 
   douyin:
     enabled: true
-    # 合集名，如「每日新闻」。留空 = 不选择合集
+    # 合集名，如「示例合集」。留空 = 不选择合集
     album: ""
     # 自主声明「内容由AI生成」
     self_declare: true
-    # 图文线配乐：值 = 收藏配乐里的曲名（如 "Opus 37"）。留空 = 不碰配乐 + 告警，**绝不猜**。
+    # 图文线配乐：值 = 收藏配乐里的曲名（如 "示例音乐"）。留空 = 不碰配乐 + 告警，**绝不猜**。
     #   只有图文线有配乐入口（视频线是视频自带音轨）。
     music: ""
 

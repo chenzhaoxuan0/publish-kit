@@ -20,7 +20,7 @@ publish-kit 的能力演进，一直靠**真实平台上反复验证**推进。�
 | # | 问题 | 根因 | 现在怎么做 |
 |---|---|---|---|
 | 1 | 抖音话题尾部变成字符交织的乱码 | ① 联想面板**永远把输入的词回显成浏览量 0 的假候选**；② `selectAllChildren`+`collapseToEnd` 挪光标会**破坏编辑器 selection 状态**；③ 面板**两段式渲染**（先回显、后远程列表，且边打字边过滤） | 判据改为「精确名 **且 浏览量 > 0**」；光标改用 `Control+End`；等**连续两轮读到相同候选列表**才判定。详见 `platforms/douyin.cjs` 的坑位注释 |
-| 2 | 抖音配乐（收藏配乐 Opus 37）一直是人工操作 | 入口文案出现两次（行标题 + 动作按钮）、面板是**抽屉不是 modal**、「使用」按钮**未 hover 时零尺寸**、乱滚会把曲名推出视口、失败时抽屉不关会挡住合集下拉 | 新增 `music` 子命令 + `lib/` 里的通道无关实现。见下方「新增模块」 |
+| 2 | 抖音配乐（收藏配乐）一直是人工操作 | 入口文案出现两次（行标题 + 动作按钮）、面板是**抽屉不是 modal**、「使用」按钮**未 hover 时零尺寸**、乱滚会把曲名推出视口、失败时抽屉不关会挡住合集下拉 | 新增 `music` 子命令 + `lib/` 里的通道无关实现。见下方「新增模块」 |
 | 3 | 抖音封面模式判据会**整条视频线 FATAL 中止** | 判据是「编辑器标题文本」；**「没步骤条」被当成错误**——但那其实是「单模式直传面板」，模式由所点槽位决定，本来就对 | 改读步骤条的 `step-active`；**没步骤条 = 告警后继续**，不 FATAL |
 | 4 | 抖音图文**完全不数图片** | 传完只 `waitForTimeout(15000)`；而「已添加 N 张」这个文字计数统计的是**上传队列**，不是实际渲染数 | 逐张传（批量多选不可靠）+ 数**实际渲染的缩略图**（限定在图集区） |
 | 5 | 抖音图文**批量多选会掉图** | 同一份代码连测 8 次，结果在 6/6、1/6、0/6 之间跳 | 逐张传，每张等落位 |
@@ -79,7 +79,7 @@ publish-kit 的能力演进，一直靠**真实平台上反复验证**推进。�
 
 ### 为什么做这一轮
 
-两个真实工作区（`content` 的每日新闻线、`operation` 的审美卡片线）各自跑着成熟的发布实践，
+两个生产工作区各自跑着成熟的发布实践，
 两边**各写各的**。把两边的现行实践搬进本仓库时，暴露了本仓库最大的结构缺口：
 
 **本仓库的编排接口是「一份物料打所有平台」**：
@@ -128,7 +128,7 @@ node bin/publish-all.cjs --media ./cards --count 8 --title "标题" --body-file 
 ```yaml
 version: 1
 content:
-  key: "2026-10-26_AI热点速递卡片"   # 防重复闸门的内容标识
+  key: "2026-10-26_示例专题"          # 防重复闸门的内容标识
 variants:                            # 分发变体：同一份内容的不同形态
   image:
     slots:
@@ -138,7 +138,7 @@ variants:                            # 分发变体：同一份内容的不同�
         bodyFile: "manuscript/douyin.txt"
         media: "upload-kit/media"
         count: 8
-        options: { album: "每日新闻", music: "Opus 37" }
+        options: { album: "示例合集", music: "示例音乐" }
   video:
     slots:
       - platform: shipinhao
@@ -163,7 +163,7 @@ variants:                            # 分发变体：同一份内容的不同�
 
 | 进 publish-kit（通用能力） | 留在工作区（特有约定） |
 |---|---|
-| 平台填单知识与判据 | 台账**格式**（publish.yaml / operation 的 publish.yaml） |
+| 平台填单知识与判据 | 台账**格式**（各生产工作区自己的 publish.yaml） |
 | 发布清单**模型**（形状） | 清单里的**具体路径**（`manuscript/dy-body.txt` 等） |
 | 失败诊断分级 | 日更流水线骨架（找 ready 期、上游交付门禁） |
 | 截图降级、等待原语、编排、并发口径 | link-hub 页面与其 HTTP 端点、留痕文件结构 |
@@ -208,10 +208,10 @@ variants:                            # 分发变体：同一份内容的不同�
    **开源用户零影响**。
 
 > ✅ **2026-10-27 阶段 1 落地（架构层 + 抖音示范，真机验证待做）**：
-> - `lib/driver.cjs` —— 通道工厂。通道判定：环境事实优先（`globalThis.__OP_ARGS__` 只可能由
+> - `lib/driver.cjs` —— 通道工厂。通道判定：环境事实优先（`globalThis.__KIT_ARGS__` 只可能由
 >   `bin/ego-run.ps1` 的 wrapper 注入），`runtime.driver` 是意图声明（声明 ego 却在普通
 >   node 里跑 → 明确报错，不静默回落）。patchright **惰性加载**（ego 运行时绝不 import 它）。
-> - `lib/drivers/ego.cjs` —— ego 门面，**回灌自 operation/04_skills/ego-publish/lib/runtime.mjs**
+> - `lib/drivers/ego.cjs` —— ego 门面，**回灌自生产工作区的 ego-publish runtime**
 >   （死页自愈 openSpaceAuto/getPage、截图竞速、filechooser 重试、fillGuard、fillEditor 等
 >   2026-10-22~24 真机验证过的实现）。对外暴露 Playwright 形状的 page/ctx：
 >   `url()` 异步化、`waitForEvent('filechooser')→waitForFileChooser`、`screenshot` 剥 timeout、
@@ -223,12 +223,12 @@ variants:                            # 分发变体：同一份内容的不同�
 > - 抖音示范：bootstrap 换 driver 工厂、`page.url()`/`ctx.pages()` 异步化、`--force` 三形态归一；
 >   顺手修了存量 bug（`sleep()` 在 upload/cover 路径被裸调但从未定义 → ReferenceError）。
 > - 门面纯逻辑进 selftest（132 项全绿：死页自愈换名、接管被拒原样抛、截图剥 timeout 等）。
-> - **真机验证（2026-10-27 凌晨，aesthetic/2026-10-20_bento-grids 欠账补发实测）**：
+> - **真机验证（2026-10-27 凌晨，一期欠账内容的补发实测）**：
 >   全链路 6 步（open→upload→fill→music→collect→shot+handoff）在 ego 通道跑通，
->   表单 6/6 图 + 标题/正文/4 话题 chip + 合集「审美积累」+ 自主声明全部落位，停在发布按钮前。
+>   表单 6/6 图 + 标题/正文/4 话题 chip + 目标合集 + 自主声明全部落位，停在发布按钮前。
 >   实测抓出并当场修掉 3 个通道缺陷：
 >   ① **spawn stdin 挂死** —— node spawn pwsh 默认 stdin pipe 时 ego-browser CLI 启动即僵死
->     （CPU 0），`stdio: ['ignore','pipe','pipe']`（对齐 operation）解决；
+>     （CPU 0），`stdio: ['ignore','pipe','pipe']`（对齐生产库）解决；
 >   ② **可选项转发陷阱** —— ego 对显式 undefined 实参敏感（`evaluate(fn, undefined)` 报
 >     "must be JSON-serializable"），门面全部可选项改经 `fwd()`（剥尾部 undefined）转发；
 >   ③ **上传入口文案** —— 第 1 张传完后抖音上传区进入「继续添加」态，原 file input 消失，
@@ -266,39 +266,39 @@ variants:                            # 分发变体：同一份内容的不同�
 
 ---
 
-## 六、与 content 工作区的关系
+## 六、与上游生产工作区的关系
 
-`publish-kit` 是**通用工具**，本仓库（content）是一个**具体的内容生产线**。
+`publish-kit` 是**通用工具**，上游生产工作区是**具体的内容生产线**。
 两者共享平台知识，但用途不同：
 
-| | publish-kit（本仓库） | content 工作区 |
+| | publish-kit（本仓库） | 生产工作区 |
 |---|---|---|
 | 定位 | 开源通用填单工具集 | 自媒体内容生产线（选题→卡片→视频→多平台发布→复盘） |
 | 通道 | Playwright + CDP 连外部 Chrome | 有两条：Playwright（publish-kit）+ ego lite 独立浏览器 |
-| 台账 | `publish.ledger`（**可选**） | `01_projects/<期>/publish.yaml`（L1 唯一事实源，必需） |
-| 编排 | `bin/publish-all.cjs`（通用并行） | workflow yaml 驱动的多步骤流水线 |
+| 台账 | `publish.ledger`（**可选**） | 期级 publish.yaml（唯一事实源，必需） |
+| 编排 | `bin/publish-all.cjs`（通用并行） | 流水线驱动的多步骤编排 |
 
-**知识流向**：在 content 工作区实测出来的东西（平台改版、新坑、更好的判据），
+**知识流向**：在生产工作区实测出来的东西（平台改版、新坑、更好的判据），
 应该**回灌**到本仓库 —— 本文件第一节列的就是这样一批。
-反过来，本仓库的横向能力层（等待/日志/体检/台账/编排）也可以被 content 复用。
+反过来，本仓库的横向能力层（等待/日志/体检/台账/编排）也可以被生产工作区复用。
 
 **纪律**：
 - 平台知识（选择器、坑位、判据）→ 回灌本仓库，**且要带实测依据**（口径数字要标明来源）
-- content 工作区的**项目特有约定**（台账格式、workflow、素材目录）→ **不要**搬进本仓库
+- 生产工作区的**项目特有约定**（台账格式、流水线节奏、素材目录）→ **不要**搬进本仓库
 - 硬闸（会阻塞的判据）必须有实测依据；没有依据的口径用**软线**（只告警）
 - ⚠️ **两边是独立仓库，代码不能共享 —— 所以平台知识会漂移。**
   改了一边的平台逻辑，**另一边要同步**：本仓库是**开源主仓**（面向所有用户），
-  content 工作区是**重度使用方**。以本仓库为准，回灌到 content 侧。
+  生产工作区是**重度使用方**。以本仓库为准，回灌到生产侧。
   同步清单见下面第七节。
 
 ---
 
 ## 七、这一轮内化的同步清单
 
-publish-kit（Playwright）与 content 工作区（ego lite）是**独立仓库，代码不能共享**。
+publish-kit（Playwright）与生产工作区（ego lite）是**独立仓库，代码不能共享**。
 这一轮两边都改了，**同步状态如下**：
 
-| 能力 | publish-kit | content/ego-publish | 一致？ |
+| 能力 | publish-kit | 生产库 ego-publish | 一致？ |
 |---|---|---|---|
 | 抖音话题单轮法 | ✅ `platforms/douyin.cjs` | ✅ `lib/douyin-topics.mjs` | ✅ |
 | **知乎想法编辑器入口** | ✅ `platforms/zhihu-pin.cjs`（2026-10-26 重写：点「发想法」BUTTON + placeholder 兜底 + 最多重试 3 次） | ✅ `platforms/zhihu.mjs`（2026-10-20 定位、10-22 补重试） | ✅ **2026-10-26 补同步**（此前 ego 侧早已注明本仓库这条路子失效，本仓库未同步 → B 通道在当前 UI 上恒 0 宽 FATAL） |
@@ -312,28 +312,28 @@ publish-kit（Playwright）与 content 工作区（ego lite）是**独立仓库�
 | 条件等待 / 随机节奏 | ✅ `lib/wait.cjs` | ✅ `lib/runtime.mjs` | ⚠️ 语义一致、代码各一份 |
 | 长文本一次性插入 | ✅ `lib/wait.cjs` | ✅（抖音脚本内联） | ⚠️ |
 | 起浏览器前体检 | ✅ `lib/preflight.cjs` | ✅ `lib/preflight.mjs` | ⚠️ |
-| 并行编排 | ✅ `lib/publish-all.cjs` | ✅ `tools/publish-all.mjs` | ⚠️ |
+| 并行编排 | ✅ `lib/publish-all.cjs` | ✅ 生产库编排器 | ⚠️ |
 | 防重复台账 | ✅ `lib/ledger.cjs`（可选） | ✅ `lib/ledger.mjs`（必需） | ⚠️ 语义不同（见下） |
-| **发布清单（manifest）** | ✅ `lib/manifest.cjs` + `bin/publish-manifest.cjs`（2026-10-26 新增） | ✅ `lib/plan.mjs`（形状同源，路径是 content 特有） | ⚠️ **形状已对齐，载体不同** —— content 侧是硬编码 JS 常量，本仓库是 YAML 数据文件（**多内容类型兼容的关键**）。⚠️ **content 侧待回灌**：把 `plan.mjs` 的路径迁成本仓库的清单文件 |
+| **发布清单（manifest）** | ✅ `lib/manifest.cjs` + `bin/publish-manifest.cjs`（2026-10-26 新增） | ✅ 生产库 plan 模块（形状同源，路径是生产侧特有） | ⚠️ **形状已对齐，载体不同** —— 生产库侧是硬编码 JS 常量，本仓库是 YAML 数据文件（**多内容类型兼容的关键**）。⚠️ **生产库侧待回灌**：把 plan 模块的路径迁成本仓库的清单文件 |
 | **抖音命令序列** | ✅ `lib/manifest.cjs` `planCommands()`（open→upload→fill→music/collect→cover→shot） | ✅ ego 侧是单进程内多步 | ⚠️ **语义一致、实现不同**：本仓库是「一个平台脚本 + 多个子命令」，ego 侧是一个脚本内部走完。⚠️ 本仓库侧 **2026-10-26 修掉了「只开页不填单却报成功」的 bug** |
-| **失败自动诊断分级** | ✅ `lib/diagnose.cjs`（2026-10-26 新增） | ❌ 无 | ⚠️ **本仓库领先** → 应回灌到 content 侧编排层 |
-| **截图降级为告警** | ✅ `lib/shot.cjs`（2026-10-26 新增） | ✅ `lib/runtime.mjs`（operation 版 2026-10-24 起） | ✅ 语义一致、代码各一份 |
-| **浏览器平台自动重试 1 次（API 豁免）** | ✅ `lib/publish-all.cjs`（2026-10-26 新增） | ✅ operation 版编排层 | ✅ 语义一致、代码各一份 |
-| **平台↔链接域名闸 + 匿名核验** | ✅ `lib/platform-urls.cjs`（2026-10-26 新增） | ✅ `04_skills/lib/link-backfill.mjs`（`urlMatchesPlatform`，更全） | ⚠️ **content 侧更厚**（还带候选串认领、note 继承）→ 本仓库侧**只取了通用内核** |
+| **失败自动诊断分级** | ✅ `lib/diagnose.cjs`（2026-10-26 新增） | ❌ 无 | ⚠️ **本仓库领先** → 应回灌到生产库编排层 |
+| **截图降级为告警** | ✅ `lib/shot.cjs`（2026-10-26 新增） | ✅ `lib/runtime.mjs`（生产库版 2026-10-24 起） | ✅ 语义一致、代码各一份 |
+| **浏览器平台自动重试 1 次（API 豁免）** | ✅ `lib/publish-all.cjs`（2026-10-26 新增） | ✅ 生产库编排层 | ✅ 语义一致、代码各一份 |
+| **平台↔链接域名闸 + 匿名核验** | ✅ `lib/platform-urls.cjs`（2026-10-26 新增） | ✅ 生产库 link-backfill 模块（`urlMatchesPlatform`，更全） | ⚠️ **生产库侧更厚**（还带候选串认领、note 继承）→ 本仓库侧**只取了通用内核** |
 | **图集断号检查** | ✅ `lib/preflight.cjs`（2026-10-26 新增） | ✅ `lib/preflight.mjs` | ✅ |
-| **公众号草稿核验 + 素材复用** | ✅ `platforms/wechat.cjs verify` + `--material-ids`（2026-10-26 新增） | ✅ operation 版 `wechat.mjs` | ⚠️ 语义一致、代码各一份（**两边都是 API 通道，凭证共用**） |
+| **公众号草稿核验 + 素材复用** | ✅ `platforms/wechat.cjs verify` + `--material-ids`（2026-10-26 新增） | ✅ 生产库 `wechat` 脚本 | ⚠️ 语义一致、代码各一份（两边都是 API 通道） |
 
 **⚠️ 的三处说明**：
 - 条件等待 / 长文本插入：两边**语义一致但代码各一份** —— 因为运行时的 API 不同
   （Playwright 的 `page.keyboard.insertText` vs ego lite 的 `page.keyboard.insertText`，
   但等待/回读封装写法不同）。**行为要一致，实现可以不同**。
-- 体检：publish-kit 的 `preflight` 是**通用张数/长度检查**；content 的 `preflight.mjs`
+- 体检：publish-kit 的 `preflight` 是**通用张数/长度检查**；生产库的 `preflight`
   还包含**台账状态**检查（那边的台账是必需的，这边是可选的）。
-- 台账：publish-kit 的台账**可选**（通用工具不该强绑）；content 的台账是**必需**
+- 台账：publish-kit 的台账**可选**（通用工具不该强绑）；生产库的台账是**必需**
   （内容生产线的事实源）。
 
 **同步纪律**：
-1. 平台逻辑以 **publish-kit 为准**（开源主仓），回灌到 content 侧。
+1. 平台逻辑以 **publish-kit 为准**（开源主仓），回灌到生产库侧。
 2. 回灌时**带上实测依据与日期** —— 没有依据的口径用软线。
 3. 改了一边，**在另一边记一笔**（commit message 或本文件的同步清单）。
 4. **不要指望代码共享** —— 两个独立仓库，漂移是默认状态，要靠纪律而不是机制。

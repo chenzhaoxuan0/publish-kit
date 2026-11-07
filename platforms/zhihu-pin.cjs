@@ -222,7 +222,7 @@ function matchStripToSources(items, srcDims) {
   console.log('知乎创作中心已开:', p.url(), '✓ 登录态正常');
 
   // 0) 激活想法编辑器（坑位⑤）
-  // ⚠️ 2026-10-26 实测修正（移植自 ego 通道 04_skills/ego-publish/platforms/zhihu.mjs，
+  // ⚠️ 2026-10-26 实测修正（移植自生产库 ego 通道的知乎脚本，
   //    那边 2026-10-20 就已定位、2026-10-22 补了重试；本仓库漏同步 → B 通道在当前
   //    知乎 UI 上**恒 0 宽直接 FATAL**，降级等于白跑）：
   //    「点 placeholder 文字元素」这条路在**当前的知乎页面上已完全失效**——

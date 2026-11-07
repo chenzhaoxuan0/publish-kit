@@ -365,7 +365,7 @@ section('lib/manifest.cjs');
       '        count: 3',
       '        options:',
       '          album: "合集A"',
-      '          music: "Opus 37"',
+      '          music: "示例音乐"',
       '  video:',
       '    slots:',
       '      - platform: shipinhao',
@@ -680,11 +680,11 @@ section('lib/driver.cjs + lib/drivers/ego.cjs');
   const { flatArgsToScriptArgs, sanitizeSpaceKey } = require('./lib/publish-all.cjs');
 
   // ── 通道判定 ──
-  const savedArgs = globalThis.__OP_ARGS__;
-  globalThis.__OP_ARGS__ = { _: ['open'] };
-  ok('__OP_ARGS__ 存在 → 判定 ego 通道', driver.runtimeChannel() === 'ego');
-  delete globalThis.__OP_ARGS__;
-  ok('__OP_ARGS__ 缺失 → 判定 playwright 通道', driver.runtimeChannel() === 'playwright');
+  const savedArgs = globalThis.__KIT_ARGS__;
+  globalThis.__KIT_ARGS__ = { _: ['open'] };
+  ok('__KIT_ARGS__ 存在 → 判定 ego 通道', driver.runtimeChannel() === 'ego');
+  delete globalThis.__KIT_ARGS__;
+  ok('__KIT_ARGS__ 缺失 → 判定 playwright 通道', driver.runtimeChannel() === 'playwright');
 
   // ── 扁平 argv → ScriptArgs 对象（编排器 ego spawn 的转换器）──
   const sa = flatArgsToScriptArgs(['open', '--kind', 'image', '--space-key', 'k1', '--handoff', '1']);
@@ -694,7 +694,7 @@ section('lib/driver.cjs + lib/drivers/ego.cjs');
   ok('扁平 argv 转换：无值 flag 读作 true', sa2.force === true);
 
   // ── 空间 key 清洗（TaskSpace 名只收 [A-Za-z0-9_-]）──
-  ok('空间 key 清洗：中文/# → -', sanitizeSpaceKey('2026-10-21_AI热点速递#video') === '2026-10-21_AI-video');
+  ok('空间 key 清洗：中文/# → -', sanitizeSpaceKey('2026-10-21_示例专题#video') === '2026-10-21_-video');
   ok('空间 key 清洗：空 → 空（调用方兜底）', sanitizeSpaceKey('') === '');
 
   // ── ego 门面：假 taskSpace 全局 + 假 raw page ──
@@ -756,7 +756,7 @@ section('lib/driver.cjs + lib/drivers/ego.cjs');
   ok('waitForEvent(filechooser) 映射到 waitForFileChooser', raw.__calls.chooserFiles[0][0] === 'C:/a/img-01.png');
 
   // 12b'. 零参 evaluate 不得携带 undefined 实参（ego 的 arguments.length 陷阱，
-  //       2026-10-27 bento-grids 实测抓到：显式 undefined → "must be JSON-serializable"）
+  //       2026-10-27 真机实测抓到：显式 undefined → "must be JSON-serializable"）
   await page.evaluate(() => 1);
   ok('零参 evaluate 只传 1 个实参', raw.__calls.evalArgc === 1, `实得 ${raw.__calls.evalArgc}`);
 
@@ -841,7 +841,7 @@ section('lib/driver.cjs + lib/drivers/ego.cjs');
   ok('接管被拒（hard stop）原样抛出', !!takeoverErr && /hard stop/i.test(takeoverErr.message));
 
   // 还原全局，避免污染后续用例
-  if (savedArgs !== undefined) globalThis.__OP_ARGS__ = savedArgs;
+  if (savedArgs !== undefined) globalThis.__KIT_ARGS__ = savedArgs;
   delete globalThis.taskSpace;
   delete globalThis.takeOverTaskSpace;
 }

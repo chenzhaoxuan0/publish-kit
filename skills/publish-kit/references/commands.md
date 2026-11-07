@@ -104,8 +104,8 @@ node platforms/douyin.cjs --kind image --media <dir> --count 8 --title "标题" 
 node platforms/douyin.cjs open   --kind image
 node platforms/douyin.cjs upload --kind image --media <dir> --count 8
 node platforms/douyin.cjs fill   --kind image --title "标题" --body-file <f>
-node platforms/douyin.cjs music  --kind image [--music "Opus 37"]   # 配乐（仅图文线）
-node platforms/douyin.cjs collect --kind image --album "每日新闻"     # 合集 + 自主声明
+node platforms/douyin.cjs music  --kind image [--music "示例音乐"]   # 配乐（仅图文线）
+node platforms/douyin.cjs collect --kind image --album "示例合集"     # 合集 + 自主声明
 node platforms/douyin.cjs shot   --kind image
 ```
 
@@ -210,7 +210,7 @@ node platforms/douyin.cjs open   --kind video
 node platforms/douyin.cjs upload --kind video --file <mp4>
 node platforms/douyin.cjs fill   --kind video --title "标题" --body-file <f>
 node platforms/douyin.cjs cover  --kind video --vertical <3x4.png> [--horizontal <4x3.png>]
-node platforms/douyin.cjs collect --kind video --album "每日新闻"
+node platforms/douyin.cjs collect --kind video --album "示例合集"
 node platforms/douyin.cjs shot   --kind video
 ```
 

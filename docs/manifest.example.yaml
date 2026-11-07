@@ -60,7 +60,7 @@
 version: 1
 
 content:
-  key: "2026-10-26_AI热点速递卡片"
+  key: "2026-10-26_示例专题"
   domain: "AI 科技"
 
 # ── 所有槽位共享的默认值（可省）────────────────────────────────
@@ -81,8 +81,8 @@ variants:
         count: 8
         weight: 68
         options:
-          album: "每日新闻"
-          music: "Opus 37"
+          album: "示例合集"
+          music: "示例音乐"
 
       - platform: zhihu
         kind: image
@@ -130,7 +130,7 @@ variants:
           - "covers/cover-4x3.png"   # 横封面
         weight: 116
         options:
-          album: "每日新闻"
+          album: "示例合集"
 
       - platform: bilibili
         kind: video
@@ -173,5 +173,5 @@ variants:
         cover: "covers/cover-3x4.png"
         weight: 42
         options:
-          album: "每日新闻"
+          album: "示例合集"
           location: "off"

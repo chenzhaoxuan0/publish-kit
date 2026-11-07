@@ -139,7 +139,7 @@ node platforms/wechat.cjs push --media <目录> --title "..." --body-file <f.txt
 | 启动 | `node platforms/douyin.cjs …` | 同一条命令，但 `driver: ego` 时**编排器自动**改经 `pwsh -NoProfile -File bin/ego-run.ps1 -Script platforms/<脚本> -ScriptArgs <json>` 启动；手工单跑也要走 ego-run.ps1（ego 运行时收不到 argv） |
 | 体检 | `node bin/doctor.cjs`（CDP/Chrome/profile） | 同一条命令，自动切成 ego 体检（找 ego-browser + 空间前缀） |
 | 登录 | `node bin/login.cjs <平台>` 开登录页 | **在 ego lite 窗口里登录**（登录态在 ego profile，所有 TaskSpace 共享） |
-| 并行 | 一个 Chrome 多标签页 | 每平台独立 TaskSpace，空间名 `pk-<平台>-<线>-<spaceKey>`（前缀 `runtime.space_prefix`，默认 `pk`，**与 operation 的 op 隔离**） |
+| 并行 | 一个 Chrome 多标签页 | 每平台独立 TaskSpace，空间名 `pk-<平台>-<线>-<spaceKey>`（前缀 `runtime.space_prefix`，默认 `pk`，**多项目并行时以不同前缀隔离**） |
 
 ego 通道的硬约束（脚本与编排器已内置，不要绕）：
 
