@@ -846,6 +846,72 @@ section('lib/driver.cjs + lib/drivers/ego.cjs');
   delete globalThis.takeOverTaskSpace;
 }
 
+// ═══ 13. lib/result-file.cjs + 编排纯函数（结果文件通道 / 断点续跑）═══
+section('lib/result-file.cjs + 编排纯函数');
+{
+  const rfPath = path.join(tmp, 'rf', 'slot.s3.log');
+  const rfAttempt = path.join(tmp, 'rf', 'slot.s3.a2.log');
+
+  // ── result-file：attempt 路径优先 + 镜像标准 json ──
+  const savedKitArgs = globalThis.__KIT_ARGS__;
+  globalThis.__KIT_ARGS__ = { resultFile: rfPath, resultFileAttempt: rfAttempt };
+  delete require.cache[require.resolve('./lib/result-file.cjs')];
+  const rf = require('./lib/result-file.cjs');
+  ok('RESULT_FILE 取当次尝试路径', rf.RESULT_FILE === rfAttempt);
+  rf.appendResult('[  1.0s] [step] line-a');
+  rf.appendResult('[  2.0s] [step] line-b');
+  ok('appendResult 逐行落盘', fs.readFileSync(rfAttempt, 'utf8').split('\n').filter(Boolean).length === 2);
+  rf.writeResult({ status: 'ready', platform: 'douyin' });
+  ok('writeResult 写当次 json', JSON.parse(fs.readFileSync(rfAttempt.replace(/\.log$/, '.json'), 'utf8')).status === 'ready');
+  ok('writeResult 镜像标准 json（编排层只读标准路径）', JSON.parse(fs.readFileSync(rfPath.replace(/\.log$/, '.json'), 'utf8')).platform === 'douyin');
+  // 换一次尝试：镜像目标不变（标准路径永远指向最新一次）
+  globalThis.__KIT_ARGS__ = { resultFile: rfPath, resultFileAttempt: path.join(tmp, 'rf', 'slot.s3.a3.log') };
+  delete require.cache[require.resolve('./lib/result-file.cjs')];
+  const rf2 = require('./lib/result-file.cjs');
+  rf2.writeResult({ status: 'ready', platform: 'douyin' });
+  ok('第二次尝试镜像到同一标准 json', JSON.parse(fs.readFileSync(rfPath.replace(/\.log$/, '.json'), 'utf8')).at !== undefined);
+  // 无参数 → 全部 no-op
+  delete globalThis.__KIT_ARGS__;
+  delete require.cache[require.resolve('./lib/result-file.cjs')];
+  const rf3 = require('./lib/result-file.cjs');
+  ok('无参数 → RESULT_FILE 为空（no-op 通道）', rf3.RESULT_FILE === '');
+  rf3.appendResult('no-op');
+  rf3.writeResult({ status: 'x' });
+  ok('无参数 → 不创建任何文件', !fs.existsSync(path.join(tmp, 'rf', 'no-op')));
+  // 还原
+  if (savedKitArgs !== undefined) globalThis.__KIT_ARGS__ = savedKitArgs;
+  delete require.cache[require.resolve('./lib/result-file.cjs')];
+
+  // ── 编排纯函数：attempt 路径 / 收尾契约 / 断点续跑划分 ──
+  const pa = require('./lib/publish-all.cjs');
+  ok('attemptLogPath 带步号与尝试号', pa.attemptLogPath('base', 3, 2) === 'base.s3.a2.log');
+  ok('resultJsonPath 是标准路径（不带尝试号）', pa.resultJsonPath('base', 3) === 'base.s3.json');
+  ok('收尾契约：result json ready = 走到交割', pa.egoSlotReachedEnd({ resJson: { status: 'ready' }, stdout: '' }) === true);
+  ok('收尾契约：交还日志行兜底（老脚本无 json）', pa.egoSlotReachedEnd({ resJson: null, stdout: '[space] 空间 x 已交还用户（spaceId=1）' }) === true);
+  ok('收尾契约：退出码 0 但没走到交割 = 不算完成', pa.egoSlotReachedEnd({ resJson: null, stdout: 'looks done' }) === false);
+
+  const mkSlot = (platform, via) => ({ platform, via, kind: 'image', commands: [{ label: 'x', args: [] }] });
+  const fakeLedger = {
+    assertNotRepeated(_cfg, { platform }) {
+      if (platform === 'douyin') {
+        const e = new Error('已是 manual-handoff');
+        e.ledgerBlock = { status: 'manual-handoff' };
+        throw e;
+      }
+    },
+  };
+  const parts = pa.partitionRepeatedSlots(
+    [mkSlot('douyin', 'browser'), mkSlot('weibo', 'browser'), mkSlot('xiaohongshu', 'manual')],
+    { contentKey: 'k' },
+    fakeLedger
+  );
+  ok('断点续跑：终态槽位划入 skipped', parts.skipped.length === 1 && parts.skipped[0].slot.platform === 'douyin');
+  ok('断点续跑：其余槽位照常执行', parts.runnable.length === 2 && parts.runnable.map((s) => s.platform).join(',') === 'weibo,xiaohongshu');
+  ok('断点续跑：manual 槽位不查闸门', parts.runnable.some((s) => s.platform === 'xiaohongshu'));
+  ok('断点续跑：allowRepeat 时全放行', pa.partitionRepeatedSlots([mkSlot('douyin', 'browser')], { contentKey: 'k', allowRepeat: true }, fakeLedger).runnable.length === 1);
+  ok('断点续跑：没配 contentKey 时不拦', pa.partitionRepeatedSlots([mkSlot('douyin', 'browser')], {}, fakeLedger).runnable.length === 1);
+}
+
 // ═══ 汇总 ══════════════════════════════════════════════════════════
 console.log(`\n${'═'.repeat(50)}`);
 console.log(`自检结果：✓ ${pass} 通过 / ✗ ${fail} 失败`);
