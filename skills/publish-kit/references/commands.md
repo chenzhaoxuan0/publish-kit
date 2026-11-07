@@ -43,6 +43,21 @@ node bin/publish-all.cjs --platforms douyin,weibo,zhihu,bilibili,shipinhao --kin
 ⚠️ **物料不全会秒级报错且不启动任何平台脚本**（编排器会并发起 N 个进程连你的浏览器，
 物料不全就别启动）。
 
+### 通道诊断与窗口恢复（2026-11-07 新增）
+
+```bash
+node bin/channel-probe.cjs                    # 失败后通道探针（只探测不填单）：
+                                              #   nav/eval/shot 三步 + CHANNEL_PROBE 行
+node bin/channel-probe.cjs --driver playwright  # 指定通道
+pwsh -NoProfile -File bin/ego-window-restore.ps1  # 把最小化/隐藏的 ego 窗口拉回可见
+```
+
+编排层（publish-manifest）在**槽位失败后自动跑探针**并给三分类判定：
+「只有截图坏了 → 可重跑」「通道整体不可用 → 先修环境」「通道通 → 平台侧问题」。
+窗口恢复在**填单前自动执行**（幂等；没 ego 进程就跳过；失败不阻断）。
+ego 通道的成败以**结果文件**为准（`logs/publish-all/<本轮>/`，stdout 可能被宿主掐断
+而退出码仍是 0）。
+
 ### 发布清单（各平台物料不同 → 用这个）
 
 ```bash
