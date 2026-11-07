@@ -923,6 +923,101 @@ section('lib/result-file.cjs + 编排纯函数');
   ok('泳道：泳道间按首次出现排序', lanes.map((l) => l[0].platform).join(',') === 'douyin,weibo,zhihu');
 }
 
+// ═══ 14. lib/guard.cjs + preflight 内置扫描（护栏三件套 / 违禁 / 规格字数）═══
+section('lib/guard.cjs + preflight 内置扫描');
+{
+  const guard = require('./lib/guard.cjs');
+  const pf = require('./lib/preflight.cjs');
+
+  // fake page：url 同步（playwright）/ 异步（ego 门面）两种形状；evaluate 返回 canned
+  const closed = [];
+  function fakePage(url, texts, { asyncUrl = false } = {}) {
+    return {
+      url: asyncUrl ? async () => url : () => url,
+      evaluate: async () => texts,
+      close: async () => {
+        closed.push(url);
+      },
+    };
+  }
+  const containerOf = (...pages) => ({ pages: async () => pages });
+
+  // ── fillGuard ──
+  const dirtyPage = fakePage('https://weibo.com/x', ['这是一段已经填好的长正文片段超过阈值']);
+  await expectThrows('交割护栏：残留文字 → 硬抛', () =>
+    guard.fillGuard(containerOf(dirtyPage), { urlPattern: 'weibo\\.com', label: '微博' })
+  );
+  ok('交割护栏：--force 跳过', (await guard.fillGuard(containerOf(dirtyPage), { force: true })).length === 0);
+  const soft = await guard.fillGuard(containerOf(dirtyPage), { soft: true });
+  ok('交割护栏：soft 模式返回残留不抛', Array.isArray(soft) && soft.length === 1);
+  ok(
+    '交割护栏：urlPattern 不命中则不扫',
+    (await guard.fillGuard(containerOf(fakePage('https://zhihu.com/x', ['很长很长很长很长很长很长的残留文字'])), { urlPattern: 'weibo\\.com' })).length === 0
+  );
+  ok(
+    '交割护栏：excludePattern 排除登录页',
+    (await guard.fillGuard(containerOf(fakePage('https://passport.weibo.com/x', ['很长很长很长很长很长很长的残留文字'])), { urlPattern: 'weibo\\.com', excludePattern: 'passport' })).length === 0
+  );
+  ok(
+    '交割护栏：ego 门面的异步 url() 也能命中',
+    (await guard.fillGuard(containerOf(fakePage('https://weibo.com/y', ['很长很长很长很长很长很长的残留文字'], { asyncUrl: true })), { urlPattern: 'weibo\\.com', soft: true })).length === 1
+  );
+  ok(
+    '交割护栏：短文字（占位符）不算残留',
+    (await guard.fillGuard(containerOf(fakePage('https://weibo.com/z', ['分享'])), { urlPattern: 'weibo\\.com' })).length === 0
+  );
+
+  // ── materialGuard ──
+  await expectThrows('物料守卫：undefined 正文 → 抛', () => guard.materialGuard('结果 undefined。'));
+  ok('物料守卫：干净正文原样返回', guard.materialGuard('正常正文', { label: 'X' }) === '正常正文');
+
+  // ── closeStalePages ──
+  closed.length = 0;
+  const n = await guard.closeStalePages(
+    containerOf(fakePage('https://weibo.com/a', []), fakePage('https://weibo.com/b', []), fakePage('https://zhihu.com/c', [])),
+    'weibo\\.com'
+  );
+  ok('清遗留页：只关 URL 命中的', n === 2 && closed.join(',') === 'https://weibo.com/a,https://weibo.com/b');
+
+  // ── preflight 内置扫描 ──
+  const scan = pf.scanForbidden('详情见 https://example.com/a 和 www.foo.top，加微信 abc12345');
+  ok('内置扫描：识别 https 链接', scan.urls.some((u) => u.includes('example.com')));
+  ok('内置扫描：识别裸域名与微信暗语', scan.urls.some((u) => u.includes('www.foo.top')) && scan.contacts.length === 1);
+  ok('违禁定性：平台写「禁」→ error', pf.forbiddenVerdict(['禁止网址链接'], 'url') === 'error');
+  ok('违禁定性：平台提到但没禁 → warn', pf.forbiddenVerdict(['可附链接'], 'url') === 'warn');
+  ok('违禁定性：平台没提 → warn', pf.forbiddenVerdict([], 'url') === 'warn');
+
+  await expectThrows('preflight：limitsNotes 写禁 + 正文有链接 → FAIL 抛错', () =>
+    pf.preflight({ platform: 'x', bodyText: '见 https://example.com', limitsNotes: ['禁止站外链接'] })
+  );
+  ok('preflight：没写 limitsNotes → 只告警不拦', (() => {
+    try {
+      pf.preflight({ platform: 'x', bodyText: '见 https://example.com/other' });
+      return true;
+    } catch {
+      return false;
+    }
+  })());
+
+  // ── specChars 双轨字数 ──
+  ok('TAG_LINE_RE：单井号形态', pf.TAG_LINE_RE.test('#网页设计 #前端'));
+  ok('TAG_LINE_RE：微博双井号形态', pf.TAG_LINE_RE.test('#网页设计# #前端#'));
+  ok(
+    'specChars：去标题行/标签行/空白',
+    pf.specChars('# 标题行\n正文内容这里\n#标签1 #标签2') === 6
+  );
+  ok('specChars：微博双井号标签行同样剔除', pf.specChars('微博正文\n#话题A# #话题B#') === 4);
+
+  async function expectThrows(name, fn) {
+    try {
+      await fn();
+      ok(name, false, '（没有抛错）');
+    } catch (e) {
+      ok(name, true);
+    }
+  }
+}
+
 // ═══ 汇总 ══════════════════════════════════════════════════════════
 console.log(`\n${'═'.repeat(50)}`);
 console.log(`自检结果：✓ ${pass} 通过 / ✗ ${fail} 失败`);

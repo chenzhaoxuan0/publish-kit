@@ -63,6 +63,8 @@ const { create } = require('../lib/log.cjs');
 const { preflight, listImages } = require('../lib/preflight.cjs');
 // 2026-10-26 内化：截图留档层——截图失败只告警，不参与成败判据
 const { shot } = require('../lib/shot.cjs');
+// 护栏三件套（fillGuard/materialGuard/closeStalePages）集中实现，跨通道兼容
+const { fillGuard, materialGuard, closeStalePages } = require('../lib/guard.cjs');
 
 // 运行日志器（**旁路**：只多打印，不改变任何既有 console.log 的行为与时机）。
 // 放模块作用域是为了让末尾的 .catch() 也能收尾（异常路径要写 failed）。
@@ -98,7 +100,7 @@ function parseArgs(argv) {
   imgs.forEach((f) => { if (!fs.existsSync(f)) throw new Error('图片缺失: ' + f); });
   // 物料守卫：正文出现 undefined/NaN 即 FATAL（曾经有上游生成脚本的 bug 把「undefined。」
   // 一路推进真实发布页，返工要删稿重发，这个洞不值得再踩一次）
-  if (/undefined|NaN|\[object Object\]/.test(text)) throw new Error('[物料守卫] 正文含 undefined/NaN，先修文件再发');
+  materialGuard(text, { label: '微博' });
 
   // 运行日志器（旁路）。放在参数校验之后：参数就不对的调用不该留下日志文件。
   log = create({ platform: 'weibo', kind: 'image' });
@@ -139,16 +141,15 @@ function parseArgs(argv) {
   const browser = await chromium.connectOverCDP(process.env.CDP_URL || cfg.cdpUrl(), { timeout: 15000 });
   const ctx = browser.contexts()[0];
 
-  // 交割护栏 + 全新页策略（与微博视频脚本沿用同一套 lessons）
-  if (!process.argv.includes('--force')) {
-    for (const t of ctx.pages().filter((x) => /weibo\.com/.test(x.url()) && !/passport/.test(x.url()))) {
-      const filled = await t.evaluate(() => [...document.querySelectorAll('textarea, [contenteditable="true"]')]
-        .map((e) => ((e.value || e.textContent || '')).trim()).filter((s) => s.length > 10)
-        .map((s) => s.slice(0, 30))).catch(() => []);
-      if (filled.length) throw new Error('[交割护栏] 微博页已有文字（疑似已交割或遗留草稿）:' + JSON.stringify(filled) + '。请人工关闭该标签页后重跑；确认可弃加 --force。');
-    }
-  }
-  for (const t of ctx.pages().filter((x) => /weibo\.com/.test(x.url()) && !/passport/.test(x.url()))) await t.close().catch(() => {});
+  // 交割护栏 + 全新页策略（lib/guard.cjs 集中实现；跨通道兼容 —— playwright 的
+  // url() 是同步的、ego 门面是异步的，护栏里统一 await）
+  await fillGuard(ctx, {
+    urlPattern: 'weibo\\.com',
+    excludePattern: 'passport',
+    label: '微博',
+    force: process.argv.includes('--force'),
+  });
+  await closeStalePages(ctx, 'weibo\\.com(?!.*passport)', { label: '微博' });
   const p = await ctx.newPage();
   await p.goto('https://weibo.com/', { timeout: 45000, waitUntil: 'domcontentloaded' }).catch(() => {});
   await sleep(8000);

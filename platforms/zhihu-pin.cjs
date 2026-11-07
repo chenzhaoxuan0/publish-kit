@@ -85,6 +85,8 @@ const { create } = require('../lib/log.cjs');
 const { preflight, listImages } = require('../lib/preflight.cjs');
 // 2026-10-26 内化：截图留档层——截图失败只告警，不参与成败判据
 const { shot } = require('../lib/shot.cjs');
+// 护栏三件套（fillGuard/materialGuard/closeStalePages）集中实现，跨通道兼容
+const { fillGuard, materialGuard, closeStalePages, listPages } = require('../lib/guard.cjs');
 
 // 每平台独立日志（旁路）。异常路径也要收尾，否则失败时反而没有留痕。
 let log = null;
@@ -165,7 +167,7 @@ function matchStripToSources(items, srcDims) {
   if (noDim) console.log(`⚠ ${noDim}/${count} 张源图读不到尺寸（非 PNG？），判据退化为宽高比`);
   // 物料守卫：正文出现 undefined/NaN 即 FATAL（曾经有上游生成脚本的 bug 把「undefined。」
   // 一路推进真实发布页，返工要删稿重发，这个洞不值得再踩一次）
-  if (/undefined|NaN|\[object Object\]/.test(title + text)) throw new Error('[物料守卫] 正文含 undefined/NaN，先修文件再发');
+  materialGuard(title + text, { label: '知乎想法' });
 
   // 2026-10-22：每平台独立日志（旁路，只多打不改原有 console 输出）
   log = create({ platform: 'zhihu-pin', kind: 'image' });
@@ -201,18 +203,15 @@ function matchStripToSources(items, srcDims) {
   //   ① 视频投稿页（upload-video）里已填的标题/介绍会被当成「已交割的想法」而误拦；
   //   ② 更糟——后面那行「关掉所有知乎标签页」会**连同已填好的视频表单一起关掉**。
   //   现在：只管非 upload-video 的知乎页（=想法页），upload-video 页原样保留。
-  const pinTabs = ctx.pages().filter((x) => /zhihu\.com/.test(x.url()) && !/upload-video/.test(x.url()));
-  const keepVideo = ctx.pages().filter((x) => /zhihu\.com\/upload-video/.test(x.url()));
+  //   （lib/guard.cjs 集中实现；url 统一 await，ego 门面的异步 url() 也能命中）
+  const keepVideo = (await listPages(ctx)).filter((x) => /zhihu\.com\/upload-video/.test(x.url));
   if (keepVideo.length) console.log('检测到 ' + keepVideo.length + ' 个知乎视频投稿页（已填表单），原样保留不碰');
-  if (!process.argv.includes('--force')) {
-    for (const t of pinTabs) {
-      const filled = await t.evaluate(() => [...document.querySelectorAll('textarea, [contenteditable="true"]')]
-        .map((e) => ((e.value || e.textContent || '')).trim()).filter((s) => s.length > 10)
-        .map((s) => s.slice(0, 30))).catch(() => []);
-      if (filled.length) throw new Error('[交割护栏] 知乎想法页已有文字（疑似已交割或遗留草稿）:' + JSON.stringify(filled) + '。请人工关闭该标签页后重跑；确认可弃加 --force。');
-    }
-  }
-  for (const t of pinTabs) await t.close().catch(() => {});
+  await fillGuard(ctx, {
+    urlPattern: 'zhihu\\.com(?!.*upload-video)',
+    label: '知乎想法',
+    force: process.argv.includes('--force'),
+  });
+  await closeStalePages(ctx, 'zhihu\\.com(?!.*upload-video)', { label: '知乎想法' });
   const p = await ctx.newPage();
   await p.goto('https://www.zhihu.com/creator', { timeout: 45000, waitUntil: 'domcontentloaded' }).catch(() => {});
   await sleep(9000);

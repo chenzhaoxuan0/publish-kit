@@ -83,6 +83,8 @@ const { shot } = require('../lib/shot.cjs');
 const { sleep } = require('../lib/wait.cjs');
 // 运行通道工厂：playwright（默认）| ego —— 通道差异全部收在这里
 const drv = require('../lib/driver.cjs');
+// 护栏三件套集中实现（fillGuard/materialGuard/closeStalePages）
+const { materialGuard } = require('../lib/guard.cjs');
 
 const UPLOAD_URL = 'https://creator.douyin.com/creator-micro/content/upload';
 
@@ -576,7 +578,7 @@ async function kindOf(page) {
     const bodyNorm = body.replace(/\r\n/g, '\n').replace(/\n{2,}/g, '\n');
     const main = bodyNorm.split('\n#')[0];
     // 物料守卫：正文文件里出现 undefined/NaN 即 FATAL（2026-09-28 生成 bug 曾外溢到线上内容）
-    if (/undefined|NaN|\[object Object\]/.test(main)) throw new Error('[物料守卫] body-file 含 undefined/NaN，疑似上游生成 bug：先修文件再填单');
+    materialGuard(main, { label: '抖音' });
     const topicTags = (bodyNorm.match(/#[^\s#]+/g) || []).map((x) => x.slice(1));
     await editor.click();
     await page.waitForTimeout(500);
